@@ -189,26 +189,26 @@ final class DeclarationVisitor: SyntaxVisitor {
 
     override func visit(_ node: InitializerDeclSyntax) -> SyntaxVisitorContinueKind {
         let location = node.startLocation(converter: converter)
-        let params = node.signature.parameterClause.parameters.map { param in
+        let params: String = node.signature.parameterClause.parameters.map { param -> String in
             let label = param.firstName.text
             let type = param.type.trimmedDescription
             if let secondName = param.secondName?.text {
-                return "\(label) \(secondName): \(type)"
+                return label + " " + secondName + ": " + type
             }
-            return "\(label): \(type)"
+            return label + ": " + type
         }.joined(separator: ", ")
 
         let failable = node.optionalMark?.text ?? ""
 
         let decl = ExtractedDeclaration(
             kind: .initializer,
-            name: "init\(failable)",
+            name: "init" + failable,
             line: location.line,
             column: location.column,
             accessLevel: extractAccessLevel(node.modifiers),
             attributes: extractAttributes(node.attributes),
             modifiers: extractModifiers(node.modifiers),
-            signature: "(\(params))",
+            signature: "(" + params + ")",
             documentation: extractDocComment(node.leadingTrivia),
             parent: currentParent
         )
@@ -329,26 +329,26 @@ final class DeclarationVisitor: SyntaxVisitor {
     }
 
     private func buildFunctionSignature(_ node: FunctionDeclSyntax) -> String {
-        let params = node.signature.parameterClause.parameters.map { param in
+        let params: String = node.signature.parameterClause.parameters.map { param -> String in
             let label = param.firstName.text
             let type = param.type.trimmedDescription
             if let secondName = param.secondName?.text {
-                return "\(label) \(secondName): \(type)"
+                return label + " " + secondName + ": " + type
             }
-            return "\(label): \(type)"
+            return label + ": " + type
         }.joined(separator: ", ")
 
-        var sig = "(\(params))"
+        var sig = "(" + params + ")"
 
         if let returnClause = node.signature.returnClause {
-            sig += " -> \(returnClause.type.trimmedDescription)"
+            sig += " -> " + returnClause.type.trimmedDescription
         }
 
         if node.signature.effectSpecifiers?.asyncSpecifier != nil {
-            sig = "async \(sig)"
+            sig = "async " + sig
         }
         if node.signature.effectSpecifiers?.throwsClause != nil {
-            sig = "throws \(sig)"
+            sig = "throws " + sig
         }
 
         return sig

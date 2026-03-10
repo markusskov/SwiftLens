@@ -3,6 +3,7 @@ import SwiftSyntax
 /// Extracts SwiftUI view composition relationships from `body` properties.
 final class SwiftUIVisitor: SyntaxVisitor {
     var viewCompositions: [ExtractedViewComposition] = []
+    var environmentInjections: [ExtractedEnvironmentInjection] = []
 
     private let converter: SourceLocationConverter
 
@@ -79,14 +80,34 @@ final class SwiftUIVisitor: SyntaxVisitor {
         }
     }
 
-    // MARK: - View composition detection
+    // MARK: - View composition & environment injection detection
 
     override func visit(_ node: FunctionCallExprSyntax) -> SyntaxVisitorContinueKind {
+        let callee = node.calledExpression
+
+        // Detect .environment() / .environmentObject() modifier injections.
+        // These can appear anywhere — in body, helper properties, scene builders —
+        // so we only require being inside a type, not inside body specifically.
+        if let parentView = typeStack.last,
+           let member = callee.as(MemberAccessExprSyntax.self) {
+            let name = member.declName.baseName.text
+            if name == "environment" || name == "environmentObject" {
+                if let firstArg = node.arguments.first {
+                    let keyPath = firstArg.expression.trimmedDescription
+                    let location = node.startLocation(converter: converter)
+                    environmentInjections.append(ExtractedEnvironmentInjection(
+                        viewName: parentView,
+                        keyPath: keyPath,
+                        line: location.line
+                    ))
+                }
+            }
+        }
+
+        // View composition detection requires being inside a body property.
         guard insideBody, let parentView = typeStack.last else {
             return .visitChildren
         }
-
-        let callee = node.calledExpression
 
         // Direct view reference: `SomeView(...)`
         if let ref = callee.as(DeclReferenceExprSyntax.self) {

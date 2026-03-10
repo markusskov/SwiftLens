@@ -121,6 +121,36 @@ public struct GraphSchema: Sendable {
             try db.create(indexOn: "wrapper_usage", columns: ["symbolId"])
         }
 
+        migrator.registerMigration("v2_environment_injections") { db in
+            try db.create(table: "environment_injections") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.belongsTo("project", inTable: "projects").notNull()
+                t.column("viewSymbolId", .integer)
+                    .notNull()
+                    .references("symbols", onDelete: .cascade)
+                t.column("keyPath", .text).notNull()
+                t.column("filePath", .text)
+                t.column("line", .integer)
+            }
+            try db.create(indexOn: "environment_injections", columns: ["viewSymbolId"])
+            try db.create(indexOn: "environment_injections", columns: ["projectId", "keyPath"])
+        }
+
+        migrator.registerMigration("v3_type_references") { db in
+            try db.create(table: "type_references") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.belongsTo("project", inTable: "projects").notNull()
+                t.column("sourceSymbolId", .integer)
+                    .notNull()
+                    .references("symbols", onDelete: .cascade)
+                t.column("referencedTypeName", .text).notNull()
+                t.column("filePath", .text)
+                t.column("line", .integer)
+            }
+            try db.create(indexOn: "type_references", columns: ["sourceSymbolId"])
+            try db.create(indexOn: "type_references", columns: ["projectId", "referencedTypeName"])
+        }
+
         migrator.registerMigration("v1_fts5") { db in
             try db.create(virtualTable: "symbols_fts", using: FTS5()) { t in
                 t.synchronize(withTable: "symbols")

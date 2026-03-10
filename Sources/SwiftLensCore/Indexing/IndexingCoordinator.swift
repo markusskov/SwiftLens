@@ -90,11 +90,17 @@ public actor IndexingCoordinator {
         }
 
         // Run post-processing
+        try await resolveUnresolvedPlaceholders(projectId: projectId)
+
         let merger = ExtensionMerger(db: db)
         try await merger.merge(projectId: projectId)
 
         let conformanceResolver = ConformanceResolver(db: db)
         try await conformanceResolver.resolve(projectId: projectId)
+
+        try await resolveEnvironmentEdges(projectId: projectId)
+
+        try await resolveTypeReferences(projectId: projectId)
 
         return IndexResult(
             projectId: projectId,
@@ -363,6 +369,62 @@ public actor IndexingCoordinator {
                     )
                 }
 
+                // Remove old environment injections from this file
+                try db.execute(
+                    sql: "DELETE FROM environment_injections WHERE projectId = ? AND filePath = ?",
+                    arguments: [projectId, result.filePath]
+                )
+
+                // Process environment injections (.environment() modifier calls)
+                for injection in result.environmentInjections {
+                    let viewQN = result.declarations
+                        .filter { $0.name == injection.viewName }
+                        .first
+                        .map { Self.buildQualifiedName(decl: $0, filePath: result.filePath) }
+
+                    if let viewQN, let viewId = symbolIds[viewQN] {
+                        var record = EnvironmentInjectionRecord(
+                            projectId: projectId,
+                            viewSymbolId: viewId,
+                            keyPath: injection.keyPath,
+                            filePath: result.filePath,
+                            line: injection.line
+                        )
+                        try record.insert(db)
+                    }
+                }
+
+                // Remove old type references from this file
+                try db.execute(
+                    sql: "DELETE FROM type_references WHERE projectId = ? AND filePath = ?",
+                    arguments: [projectId, result.filePath]
+                )
+
+                // Process type references
+                for ref in result.typeReferences {
+                    // Find the containing symbol — prefer non-extension declarations
+                    let sourceDecl = result.declarations
+                        .filter { $0.name == ref.containingSymbol }
+                        .sorted { ($0.kind != .extension ? 0 : 1) < ($1.kind != .extension ? 0 : 1) }
+                        .first
+
+                    if let sourceDecl {
+                        let sourceQN = Self.buildQualifiedName(
+                            decl: sourceDecl, filePath: result.filePath
+                        )
+                        if let sourceId = symbolIds[sourceQN] {
+                            var record = TypeReferenceRecord(
+                                projectId: projectId,
+                                sourceSymbolId: sourceId,
+                                referencedTypeName: ref.referencedTypeName,
+                                filePath: result.filePath,
+                                line: ref.line
+                            )
+                            try record.insert(db)
+                        }
+                    }
+                }
+
                 // Process view compositions
                 for comp in result.viewCompositions {
                     // Find parent view symbol
@@ -373,12 +435,26 @@ public actor IndexingCoordinator {
 
                     guard let parentQN, let parentId = symbolIds[parentQN] else { continue }
 
-                    // Find or create child view symbol (might be in another file)
+                    // Find child view symbol (might be in another file)
+                    // Prefer real symbols over unresolved placeholders
                     var childId = try Int64.fetchOne(
                         db,
-                        sql: "SELECT id FROM symbols WHERE projectId = ? AND name = ? AND kind IN ('struct', 'class')",
+                        sql: """
+                            SELECT id FROM symbols
+                            WHERE projectId = ? AND name = ? AND kind IN ('struct', 'class')
+                            AND qualifiedName NOT LIKE 'unresolved:%'
+                            """,
                         arguments: [projectId, comp.childView]
                     )
+
+                    if childId == nil {
+                        // Check for existing placeholder
+                        childId = try Int64.fetchOne(
+                            db,
+                            sql: "SELECT id FROM symbols WHERE projectId = ? AND qualifiedName = ?",
+                            arguments: [projectId, "unresolved:" + comp.childView]
+                        )
+                    }
 
                     if childId == nil {
                         // Create a placeholder symbol for the child view
@@ -386,13 +462,13 @@ public actor IndexingCoordinator {
                             projectId: projectId,
                             kind: NodeKind.struct.rawValue,
                             name: comp.childView,
-                            qualifiedName: "unresolved:\(comp.childView)"
+                            qualifiedName: "unresolved:" + comp.childView
                         )
                         try? placeholder.insert(db)
                         childId = placeholder.id ?? (try? Int64.fetchOne(
                             db,
                             sql: "SELECT id FROM symbols WHERE projectId = ? AND qualifiedName = ?",
-                            arguments: [projectId, "unresolved:\(comp.childView)"]
+                            arguments: [projectId, "unresolved:" + comp.childView]
                         ))
                     }
 
@@ -498,6 +574,177 @@ public actor IndexingCoordinator {
                     arguments: [projectId, path]
                 )
             }
+        }
+    }
+
+    // MARK: - Resolve Placeholders
+
+    /// Replace unresolved placeholder symbols with real symbols where they now exist.
+    private func resolveUnresolvedPlaceholders(projectId: Int64) async throws {
+        try await db.dbWriter.write { db in
+            // Find all unresolved placeholders that now have a real symbol
+            let placeholders = try Row.fetchAll(db, sql: """
+                SELECT p.id AS placeholderId, r.id AS realId
+                FROM symbols p
+                JOIN symbols r ON r.projectId = p.projectId AND r.name = p.name
+                    AND r.qualifiedName NOT LIKE 'unresolved:%'
+                    AND r.kind IN ('struct', 'class', 'enum', 'actor')
+                WHERE p.projectId = ? AND p.qualifiedName LIKE 'unresolved:%'
+                """, arguments: [projectId])
+
+            for row in placeholders {
+                let placeholderId: Int64 = row["placeholderId"]
+                let realId: Int64 = row["realId"]
+
+                // Repoint edges from placeholder to real symbol
+                try db.execute(
+                    sql: "UPDATE OR IGNORE edges SET targetId = ? WHERE targetId = ?",
+                    arguments: [realId, placeholderId]
+                )
+                try db.execute(
+                    sql: "UPDATE OR IGNORE edges SET sourceId = ? WHERE sourceId = ?",
+                    arguments: [realId, placeholderId]
+                )
+
+                // Delete the placeholder (cascades remaining duplicate edges)
+                try db.execute(
+                    sql: "DELETE FROM symbols WHERE id = ?",
+                    arguments: [placeholderId]
+                )
+            }
+        }
+    }
+
+    // MARK: - Resolve Environment Edges
+
+    /// Create usesEnvironment edges: view → type for @Environment usage.
+    /// Cross-references wrapper_usage (wrapperName='Environment') with environment_keys
+    /// to find the value type, then links the consuming view to that type.
+    private func resolveEnvironmentEdges(projectId: Int64) async throws {
+        try await db.dbWriter.write { db in
+            // Strategy 1: Match @Environment(\.keyPath) via environment_keys table
+            // wrapper_usage.argument like "\.appServices" → strip "\." → "appServices"
+            // environment_keys.keyName = "appServices" → valueType = "AppServices"
+            // Then find the view (parent of the property via CONTAINS edge) and the type symbol.
+            let keyPathUsages = try Row.fetchAll(db, sql: """
+                SELECT
+                    wu.id AS wrapperUsageId,
+                    wu.symbolId AS propertyId,
+                    wu.argument,
+                    ek.valueType,
+                    parentEdge.sourceId AS viewId
+                FROM wrapper_usage wu
+                JOIN edges parentEdge ON parentEdge.targetId = wu.symbolId
+                    AND parentEdge.kind = ?
+                JOIN environment_keys ek ON ek.projectId = wu.projectId
+                    AND ek.keyName = REPLACE(wu.argument, '\\.', '')
+                WHERE wu.projectId = ?
+                    AND wu.wrapperName = 'Environment'
+                    AND wu.argument LIKE '\\.%'
+                    AND ek.valueType IS NOT NULL
+                """, arguments: [EdgeKind.contains.rawValue, projectId])
+
+            for row in keyPathUsages {
+                let viewId: Int64 = row["viewId"]
+                let valueType: String = row["valueType"]
+
+                // Find the type symbol for the value type
+                guard let typeId = try Int64.fetchOne(db, sql: """
+                    SELECT id FROM symbols
+                    WHERE projectId = ? AND name = ?
+                        AND kind IN ('struct', 'class', 'enum', 'actor', 'protocol')
+                        AND qualifiedName NOT LIKE 'unresolved:%'
+                    LIMIT 1
+                    """, arguments: [projectId, valueType])
+                else { continue }
+
+                // Don't create self-referencing edges
+                guard viewId != typeId else { continue }
+
+                var edge = EdgeRecord(
+                    projectId: projectId,
+                    sourceId: viewId,
+                    targetId: typeId,
+                    kind: EdgeKind.usesEnvironment.rawValue
+                )
+                try? edge.insert(db) // Ignore duplicates
+            }
+
+            // Strategy 2: Match @Environment(SomeType.self) — iOS 17+ Observable syntax
+            let typeSelfUsages = try Row.fetchAll(db, sql: """
+                SELECT
+                    wu.symbolId AS propertyId,
+                    wu.argument,
+                    parentEdge.sourceId AS viewId
+                FROM wrapper_usage wu
+                JOIN edges parentEdge ON parentEdge.targetId = wu.symbolId
+                    AND parentEdge.kind = ?
+                WHERE wu.projectId = ?
+                    AND wu.wrapperName = 'Environment'
+                    AND wu.argument LIKE '%.self'
+                    AND wu.argument NOT LIKE '\\.%'
+                """, arguments: [EdgeKind.contains.rawValue, projectId])
+
+            for row in typeSelfUsages {
+                let viewId: Int64 = row["viewId"]
+                let argument: String = row["argument"]
+                let typeName = String(argument.dropLast(5)) // Remove ".self"
+
+                guard let typeId = try Int64.fetchOne(db, sql: """
+                    SELECT id FROM symbols
+                    WHERE projectId = ? AND name = ?
+                        AND kind IN ('struct', 'class', 'enum', 'actor', 'protocol')
+                        AND qualifiedName NOT LIKE 'unresolved:%'
+                    LIMIT 1
+                    """, arguments: [projectId, typeName])
+                else { continue }
+
+                guard viewId != typeId else { continue }
+
+                var edge = EdgeRecord(
+                    projectId: projectId,
+                    sourceId: viewId,
+                    targetId: typeId,
+                    kind: EdgeKind.usesEnvironment.rawValue
+                )
+                try? edge.insert(db)
+            }
+        }
+    }
+
+    // MARK: - Resolve Type References
+
+    /// Create references edges from type_references table.
+    /// For extension sources, redirects the edge to the base type via the extends edge.
+    private func resolveTypeReferences(projectId: Int64) async throws {
+        try await db.dbWriter.write { db in
+            // Delete all existing references edges for this project
+            try db.execute(
+                sql: "DELETE FROM edges WHERE projectId = ? AND kind = ?",
+                arguments: [projectId, EdgeKind.references.rawValue]
+            )
+
+            // Resolve type references into edges in bulk.
+            // For extension sources, follow the extends edge to use the base type as source,
+            // so MovieService (not its extension) gets the references edge.
+            try db.execute(sql: """
+                INSERT OR IGNORE INTO edges (projectId, sourceId, targetId, kind)
+                SELECT DISTINCT tr.projectId,
+                    COALESCE(baseEdge.targetId, tr.sourceSymbolId),
+                    target.id,
+                    'references'
+                FROM type_references tr
+                JOIN symbols sourceSym ON sourceSym.id = tr.sourceSymbolId
+                JOIN symbols target ON target.projectId = tr.projectId
+                    AND target.name = tr.referencedTypeName
+                    AND target.kind IN ('struct', 'class', 'enum', 'actor', 'protocol', 'typeAlias')
+                    AND target.qualifiedName NOT LIKE 'unresolved:%'
+                LEFT JOIN edges baseEdge ON baseEdge.sourceId = tr.sourceSymbolId
+                    AND baseEdge.kind = 'extends'
+                    AND sourceSym.kind = 'extension'
+                WHERE tr.projectId = ?
+                    AND COALESCE(baseEdge.targetId, tr.sourceSymbolId) != target.id
+                """, arguments: [projectId])
         }
     }
 

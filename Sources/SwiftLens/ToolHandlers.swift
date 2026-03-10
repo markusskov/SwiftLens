@@ -32,6 +32,16 @@ struct ToolHandlers: Sendable {
             return try handleFindDependencies(args)
         case "reindex":
             return try await handleReindex()
+        case "find_dead_code":
+            return try handleFindDeadCode(args)
+        case "check_protocol_coverage":
+            return try handleCheckProtocolCoverage(args)
+        case "impact_analysis":
+            return try handleImpactAnalysis(args)
+        case "check_environment_injection":
+            return try handleCheckEnvironmentInjection()
+        case "audit_access_control":
+            return try handleAuditAccessControl(args)
         default:
             return CallTool.Result(
                 content: [.text("Unknown tool: \(params.name)")],
@@ -97,7 +107,7 @@ struct ToolHandlers: Sendable {
             return CallTool.Result(content: [.text("Symbol '\(name)' not found")])
         }
 
-        var output = formatSymbolDetail(detail)
+        let output = formatSymbolDetail(detail)
         return CallTool.Result(content: [.text(output)])
     }
 
@@ -287,6 +297,189 @@ struct ToolHandlers: Sendable {
         return CallTool.Result(content: [.text(output)])
     }
 
+    private func handleFindDeadCode(_ args: [String: Value]) throws -> CallTool.Result {
+        let module = args["module"]?.stringValue
+
+        let results = try queryEngine.findDeadCode(projectId: projectId, module: module)
+
+        if results.isEmpty {
+            return CallTool.Result(content: [.text("No dead code found — all symbols have incoming references.")])
+        }
+
+        var output = "Potentially dead code (\(results.count) symbols):\n\n"
+        for entry in results {
+            output += "  \(entry.kind) \(entry.name)"
+            if let mod = entry.moduleName { output += " [\(mod)]" }
+            if let path = entry.filePath, let line = entry.line {
+                output += " — \(shortenPath(path)):\(line)"
+            }
+            output += "\n"
+        }
+        output += "\nNote: These symbols have no incoming structural edges (conformsTo, inherits, composesView, usesEnvironment). Symbols used only via runtime reflection or string-based lookup may be false positives."
+        return CallTool.Result(content: [.text(output)])
+    }
+
+    private func handleCheckProtocolCoverage(_ args: [String: Value]) throws -> CallTool.Result {
+        guard let protocolName = args["protocol"]?.stringValue else {
+            return CallTool.Result(content: [.text("Missing required parameter: protocol")], isError: true)
+        }
+
+        let showSatisfied = args["show_satisfied"]?.boolValue ?? false
+
+        let result = try queryEngine.checkProtocolCoverage(
+            projectId: projectId,
+            protocolName: protocolName,
+            showSatisfied: showSatisfied
+        )
+
+        if result.requirements.isEmpty && result.conformers.isEmpty {
+            return CallTool.Result(content: [.text("Protocol '\(protocolName)' not found or has no requirements.")])
+        }
+
+        var output = "Protocol \(protocolName) — \(result.requirements.count) requirement(s), \(result.conformers.count) conformer(s):\n\n"
+
+        output += "Requirements:\n"
+        for req in result.requirements {
+            output += "  \(req.kind) \(req.name)"
+            if let sig = req.signature { output += ": \(sig)" }
+            output += "\n"
+        }
+
+        for conformer in result.conformers {
+            output += "\n\(conformer.kind) \(conformer.name)"
+            if let path = conformer.filePath, let line = conformer.line {
+                output += " — \(shortenPath(path)):\(line)"
+            }
+
+            if conformer.missing.isEmpty {
+                output += " — COMPLETE\n"
+            } else {
+                output += " — MISSING \(conformer.missing.count)\n"
+            }
+
+            if showSatisfied {
+                for name in conformer.satisfied {
+                    output += "  + \(name)\n"
+                }
+            }
+            for name in conformer.missing {
+                output += "  - \(name) (MISSING)\n"
+            }
+        }
+
+        return CallTool.Result(content: [.text(output)])
+    }
+
+    private func handleImpactAnalysis(_ args: [String: Value]) throws -> CallTool.Result {
+        guard let symbol = args["symbol"]?.stringValue else {
+            return CallTool.Result(content: [.text("Missing required parameter: symbol")], isError: true)
+        }
+
+        let maxDepth = args["max_depth"]?.intValue ?? 5
+        let directionStr = args["direction"]?.stringValue ?? "incoming"
+        let direction: DependencyDirection = switch directionStr {
+        case "outgoing": .outgoing
+        case "both": .both
+        default: .incoming
+        }
+
+        if direction == .both {
+            let incoming = try queryEngine.impactAnalysis(
+                projectId: projectId, symbolName: symbol, direction: .incoming, maxDepth: maxDepth
+            )
+            let outgoing = try queryEngine.impactAnalysis(
+                projectId: projectId, symbolName: symbol, direction: .outgoing, maxDepth: maxDepth
+            )
+
+            var output = "Impact Analysis for \(symbol):\n\n"
+            output += "== Incoming (what depends on \(symbol)) ==\n"
+            output += formatImpactTree(incoming, indent: 0)
+            output += "\n== Outgoing (what \(symbol) depends on) ==\n"
+            output += formatImpactTree(outgoing, indent: 0)
+            return CallTool.Result(content: [.text(output)])
+        }
+
+        let tree = try queryEngine.impactAnalysis(
+            projectId: projectId, symbolName: symbol, direction: direction, maxDepth: maxDepth
+        )
+
+        var output = "Impact Analysis for \(symbol) (\(directionStr)):\n\n"
+        output += formatImpactTree(tree, indent: 0)
+
+        let nodeCount = countImpactNodes(tree) - 1 // exclude root
+        if nodeCount == 0 {
+            output += "\nNo transitive dependencies found."
+        } else {
+            output += "\nTotal: \(nodeCount) symbol(s) in the dependency chain."
+        }
+
+        return CallTool.Result(content: [.text(output)])
+    }
+
+    private func handleCheckEnvironmentInjection() throws -> CallTool.Result {
+        let results = try queryEngine.checkEnvironmentInjection(projectId: projectId)
+
+        if results.isEmpty {
+            return CallTool.Result(content: [.text("No @Environment usages found.")])
+        }
+
+        let missing = results.filter { $0.status == .missing }
+        let provided = results.filter { $0.status == .provided }
+
+        var output = "Environment Injection Check (\(results.count) usages):\n\n"
+
+        if !missing.isEmpty {
+            output += "MISSING INJECTIONS (\(missing.count)) — potential runtime crashes:\n"
+            for check in missing {
+                output += "  ! \(check.viewName) reads @Environment(\(check.keyPath))"
+                if let path = check.viewFile, let line = check.viewLine {
+                    output += " — \(shortenPath(path)):\(line)"
+                }
+                output += "\n    No ancestor provides \(check.keyName) via .environment() modifier\n"
+            }
+        }
+
+        if !provided.isEmpty {
+            output += "\nPROVIDED (\(provided.count)):\n"
+            for check in provided {
+                output += "  + \(check.viewName) reads \(check.keyName)"
+                if let provider = check.injectedBy {
+                    output += " — injected by \(provider)"
+                }
+                output += "\n"
+            }
+        }
+
+        return CallTool.Result(content: [.text(output)])
+    }
+
+    private func handleAuditAccessControl(_ args: [String: Value]) throws -> CallTool.Result {
+        let module = args["module"]?.stringValue
+        let kind = args["kind"]?.stringValue.flatMap { NodeKind(rawValue: $0) }
+
+        let issues = try queryEngine.auditAccessControl(
+            projectId: projectId,
+            module: module,
+            kind: kind
+        )
+
+        if issues.isEmpty {
+            return CallTool.Result(content: [.text("No access control issues found.")])
+        }
+
+        var output = "Access Control Audit (\(issues.count) issues):\n\n"
+        for issue in issues {
+            output += "  \(issue.kind) \(issue.name): \(issue.currentAccess) → \(issue.suggestedAccess)"
+            if let path = issue.filePath, let line = issue.line {
+                output += " — \(shortenPath(path)):\(line)"
+            }
+            output += "\n    Reason: \(issue.reason)\n"
+        }
+
+        output += "\nNote: Analysis based on structural edges (conformsTo, inherits, composesView, usesEnvironment). Type references in function parameters/return types are not yet tracked."
+        return CallTool.Result(content: [.text(output)])
+    }
+
     // MARK: - Formatting Helpers
 
     private func shortenPath(_ path: String) -> String {
@@ -351,6 +544,27 @@ struct ToolHandlers: Sendable {
         }
 
         return output
+    }
+
+    private func formatImpactTree(_ node: ImpactNode, indent: Int) -> String {
+        let prefix = String(repeating: "  ", count: indent)
+        var output = prefix
+        if let edge = node.edgeKind {
+            output += "[\(edge)] "
+        }
+        output += "\(node.kind) \(node.name)"
+        if let path = node.filePath, let line = node.line {
+            output += " — \(shortenPath(path)):\(line)"
+        }
+        output += "\n"
+        for child in node.children {
+            output += formatImpactTree(child, indent: indent + 1)
+        }
+        return output
+    }
+
+    private func countImpactNodes(_ node: ImpactNode) -> Int {
+        1 + node.children.reduce(0) { $0 + countImpactNodes($1) }
     }
 
     private func formatViewTree(_ node: ViewTreeNode, indent: Int) -> String {

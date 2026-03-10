@@ -13,6 +13,11 @@ enum ToolDefinitions {
         listExtensions,
         findDependencies,
         reindex,
+        findDeadCode,
+        checkProtocolCoverage,
+        impactAnalysis,
+        checkEnvironmentInjection,
+        auditAccessControl,
     ]
 
     static let searchSymbol = Tool(
@@ -165,5 +170,99 @@ enum ToolDefinitions {
             "properties": .object([:]),
         ]),
         annotations: .init(readOnlyHint: false, idempotentHint: true)
+    )
+
+    static let findDeadCode = Tool(
+        name: "find_dead_code",
+        description: "Find potentially dead code — top-level symbols with zero incoming usage edges. Filters out entry points, test targets, protocol requirements, and wrapper properties.",
+        inputSchema: .object([
+            "type": .string("object"),
+            "properties": .object([
+                "module": .object([
+                    "type": .string("string"),
+                    "description": .string("Filter to a specific SPM module"),
+                ]),
+            ]),
+        ]),
+        annotations: .init(readOnlyHint: true)
+    )
+
+    static let checkProtocolCoverage = Tool(
+        name: "check_protocol_coverage",
+        description: "Check protocol conformance completeness. Shows which required members each conformer implements vs is missing. Catches missing method implementations before the compiler does.",
+        inputSchema: .object([
+            "type": .string("object"),
+            "properties": .object([
+                "protocol": .object([
+                    "type": .string("string"),
+                    "description": .string("Protocol name to check coverage for"),
+                ]),
+                "show_satisfied": .object([
+                    "type": .string("boolean"),
+                    "description": .string("Show implemented members too, not just gaps (default false)"),
+                ]),
+            ]),
+            "required": .array([.string("protocol")]),
+        ]),
+        annotations: .init(readOnlyHint: true)
+    )
+
+    static let impactAnalysis = Tool(
+        name: "impact_analysis",
+        description: "Transitive dependency analysis — walk the full dependency graph recursively to show the blast radius of changing a symbol. Shows the complete chain of types that would be affected.",
+        inputSchema: .object([
+            "type": .string("object"),
+            "properties": .object([
+                "symbol": .object([
+                    "type": .string("string"),
+                    "description": .string("Symbol name to analyze impact for"),
+                ]),
+                "max_depth": .object([
+                    "type": .string("integer"),
+                    "description": .string("Maximum traversal depth (default 5)"),
+                ]),
+                "direction": .object([
+                    "type": .string("string"),
+                    "description": .string("Direction: incoming (what depends on this), outgoing (what this depends on), or both"),
+                    "enum": .array([.string("incoming"), .string("outgoing"), .string("both")]),
+                ]),
+            ]),
+            "required": .array([.string("symbol")]),
+        ]),
+        annotations: .init(readOnlyHint: true)
+    )
+
+    static let checkEnvironmentInjection = Tool(
+        name: "check_environment_injection",
+        description: "Check for missing @Environment injections. Cross-references view tree with .environment() modifier calls to find views that read an @Environment key but no ancestor provides it — which would cause a runtime crash.",
+        inputSchema: .object([
+            "type": .string("object"),
+            "properties": .object([:]),
+        ]),
+        annotations: .init(readOnlyHint: true)
+    )
+
+    static let auditAccessControl = Tool(
+        name: "audit_access_control",
+        description: "Find symbols with overly broad access control. Identifies public symbols only used within the same file (should be internal/private) and internal symbols only used within the same file (should be private).",
+        inputSchema: .object([
+            "type": .string("object"),
+            "properties": .object([
+                "module": .object([
+                    "type": .string("string"),
+                    "description": .string("Filter to a specific SPM module"),
+                ]),
+                "kind": .object([
+                    "type": .string("string"),
+                    "description": .string("Filter by symbol kind"),
+                    "enum": .array([
+                        .string("struct"), .string("class"), .string("enum"),
+                        .string("protocol"), .string("actor"), .string("function"),
+                        .string("variable"), .string("typeAlias"),
+                    ]),
+                ]),
+            ]),
+        ]),
+        annotations: .init(readOnlyHint: true)
     )
 }

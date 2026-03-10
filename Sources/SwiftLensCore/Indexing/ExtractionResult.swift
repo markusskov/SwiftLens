@@ -7,6 +7,8 @@ public struct FileExtractionResult: Sendable {
     public var viewCompositions: [ExtractedViewComposition] = []
     public var environmentUsages: [ExtractedEnvironmentUsage] = []
     public var environmentDeclarations: [ExtractedEnvironmentDeclaration] = []
+    public var environmentInjections: [ExtractedEnvironmentInjection] = []
+    public var typeReferences: [ExtractedTypeReference] = []
 
     public init(filePath: String) {
         self.filePath = filePath
@@ -108,6 +110,32 @@ public struct ExtractedEnvironmentUsage: Sendable {
         self.viewName = viewName
         self.keyPath = keyPath
         self.propertyName = propertyName
+        self.line = line
+    }
+}
+
+/// A .environment() modifier injection in a view body.
+public struct ExtractedEnvironmentInjection: Sendable {
+    public let viewName: String        // The view providing the injection
+    public let keyPath: String         // e.g., "\.appServices" or "AppServices.self"
+    public let line: Int
+
+    public init(viewName: String, keyPath: String, line: Int) {
+        self.viewName = viewName
+        self.keyPath = keyPath
+        self.line = line
+    }
+}
+
+/// A type reference from a containing symbol to a referenced type.
+public struct ExtractedTypeReference: Sendable {
+    public let containingSymbol: String      // Enclosing type name (e.g., "MovieDetailView")
+    public let referencedTypeName: String    // Referenced type (e.g., "Movie")
+    public let line: Int
+
+    public init(containingSymbol: String, referencedTypeName: String, line: Int) {
+        self.containingSymbol = containingSymbol
+        self.referencedTypeName = referencedTypeName
         self.line = line
     }
 }

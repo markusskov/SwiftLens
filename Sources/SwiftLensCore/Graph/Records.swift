@@ -125,6 +125,40 @@ public struct EnvironmentKeyRecord: Codable, FetchableRecord, MutablePersistable
     }
 }
 
+// MARK: - Environment Injection Record
+
+public struct EnvironmentInjectionRecord: Codable, FetchableRecord, MutablePersistableRecord, Sendable {
+    public static let databaseTableName = "environment_injections"
+
+    public var id: Int64?
+    public var projectId: Int64
+    public var viewSymbolId: Int64
+    public var keyPath: String
+    public var filePath: String?
+    public var line: Int?
+
+    public mutating func didInsert(_ inserted: InsertionSuccess) {
+        id = inserted.rowID
+    }
+}
+
+// MARK: - Type Reference Record
+
+public struct TypeReferenceRecord: Codable, FetchableRecord, MutablePersistableRecord, Sendable {
+    public static let databaseTableName = "type_references"
+
+    public var id: Int64?
+    public var projectId: Int64
+    public var sourceSymbolId: Int64
+    public var referencedTypeName: String
+    public var filePath: String?
+    public var line: Int?
+
+    public mutating func didInsert(_ inserted: InsertionSuccess) {
+        id = inserted.rowID
+    }
+}
+
 // MARK: - Wrapper Usage Record
 
 public struct WrapperUsageRecord: Codable, FetchableRecord, MutablePersistableRecord, Sendable {
