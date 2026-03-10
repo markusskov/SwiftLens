@@ -11,24 +11,46 @@ public struct QueryEngine: Sendable {
 
     // MARK: - search_symbol
 
-    /// FTS5 search for symbols by name.
+    /// Search for symbols by name and/or attribute.
     public func searchSymbol(
         projectId: Int64,
-        query: String,
+        query: String? = nil,
         kind: NodeKind? = nil,
         module: String? = nil,
+        attribute: String? = nil,
         limit: Int = 20
     ) throws -> [SymbolSearchResult] {
         try db.dbWriter.read { db in
-            var sql = """
-                SELECT s.*, m.name AS moduleName
-                FROM symbols s
-                JOIN symbols_fts ON symbols_fts.rowid = s.rowid
-                LEFT JOIN modules m ON s.moduleId = m.id
-                WHERE symbols_fts MATCH ?
-                AND s.projectId = ?
-                """
-            var arguments: [any DatabaseValueConvertible] = [ftsQuery(query), projectId]
+            var sql: String
+            var arguments: [any DatabaseValueConvertible]
+
+            if let query {
+                // FTS5 text search path
+                sql = """
+                    SELECT s.*, m.name AS moduleName
+                    FROM symbols s
+                    JOIN symbols_fts ON symbols_fts.rowid = s.rowid
+                    LEFT JOIN modules m ON s.moduleId = m.id
+                    LEFT JOIN modules mf ON mf.projectId = s.projectId
+                        AND s.moduleId IS NULL AND mf.path IS NOT NULL
+                        AND s.filePath LIKE '%/' || mf.path || '/%'
+                    WHERE symbols_fts MATCH ?
+                    AND s.projectId = ?
+                    """
+                arguments = [ftsQuery(query), projectId]
+            } else {
+                // Direct query path (attribute-only search)
+                sql = """
+                    SELECT s.*, COALESCE(m.name, mf.name) AS moduleName
+                    FROM symbols s
+                    LEFT JOIN modules m ON s.moduleId = m.id
+                    LEFT JOIN modules mf ON mf.projectId = s.projectId
+                        AND s.moduleId IS NULL AND mf.path IS NOT NULL
+                        AND s.filePath LIKE '%/' || mf.path || '/%'
+                    WHERE s.projectId = ?
+                    """
+                arguments = [projectId]
+            }
 
             // Exclude unresolved placeholder symbols
             sql += " AND s.qualifiedName NOT LIKE 'unresolved:%'"
@@ -39,12 +61,74 @@ public struct QueryEngine: Sendable {
             }
 
             if let module {
-                sql += " AND m.name = ?"
+                sql += " AND COALESCE(m.name, mf.name) = ?"
                 arguments.append(module)
             }
 
-            sql += " ORDER BY rank LIMIT ?"
+            if let attribute {
+                let normalized = attribute.hasPrefix("@")
+                    ? String(attribute.dropFirst()) : attribute
+                // Match type-level attributes (stored as @Name in JSON)
+                // OR property wrapper usage (stored as Name without @)
+                sql += """
+                     AND (
+                        s.attributes LIKE ?
+                        OR EXISTS (
+                            SELECT 1 FROM wrapper_usage wu
+                            WHERE wu.symbolId = s.id AND wu.wrapperName = ?
+                        )
+                    )
+                    """
+                arguments.append("%\"@" + normalized + "\"%")
+                arguments.append(normalized)
+            }
+
+            sql += query != nil ? " ORDER BY rank LIMIT ?" : " ORDER BY s.name LIMIT ?"
             arguments.append(limit)
+
+            return try Row.fetchAll(db, sql: sql, arguments: StatementArguments(arguments))
+                .map { row in
+                    SymbolSearchResult(
+                        id: row["id"],
+                        name: row["name"],
+                        qualifiedName: row["qualifiedName"],
+                        kind: row["kind"],
+                        moduleName: row["moduleName"],
+                        filePath: row["filePath"],
+                        line: row["line"],
+                        accessLevel: row["accessLevel"],
+                        signature: row["signature"]
+                    )
+                }
+        }
+    }
+
+    // MARK: - symbols_in_file
+
+    /// List all symbols defined in a specific file.
+    public func symbolsInFile(
+        projectId: Int64,
+        filePath: String,
+        kind: NodeKind? = nil
+    ) throws -> [SymbolSearchResult] {
+        try db.dbWriter.read { db in
+            var sql = """
+                SELECT s.*, m.name AS moduleName
+                FROM symbols s
+                LEFT JOIN modules m ON s.moduleId = m.id
+                WHERE s.projectId = ?
+                AND s.filePath = ?
+                AND s.qualifiedName NOT LIKE 'unresolved:%'
+                AND s.qualifiedName NOT LIKE 'file:%'
+                """
+            var arguments: [any DatabaseValueConvertible] = [projectId, filePath]
+
+            if let kind {
+                sql += " AND s.kind = ?"
+                arguments.append(kind.rawValue)
+            }
+
+            sql += " ORDER BY s.line, s.name"
 
             return try Row.fetchAll(db, sql: sql, arguments: StatementArguments(arguments))
                 .map { row in
@@ -219,25 +303,25 @@ public struct QueryEngine: Sendable {
                 .filter(Column("kind") != NodeKind.module.rawValue)
                 .fetchOne(db)
             else {
-                return ViewTreeNode(name: rootView, filePath: nil, line: nil, children: [])
+                return ViewTreeNode(name: rootView, filePath: nil, line: nil, context: nil, children: [])
             }
 
             // Recursive CTE with parent tracking for proper tree reconstruction
             let rows = try Row.fetchAll(db, sql: """
-                WITH RECURSIVE view_tree(id, name, filePath, line, depth, parentId) AS (
-                    SELECT s.id, s.name, s.filePath, s.line, 0, CAST(NULL AS INTEGER)
+                WITH RECURSIVE view_tree(id, name, filePath, line, depth, parentId, context) AS (
+                    SELECT s.id, s.name, s.filePath, s.line, 0, CAST(NULL AS INTEGER), CAST(NULL AS TEXT)
                     FROM symbols s
                     WHERE s.id = ?
 
                     UNION ALL
 
-                    SELECT child.id, child.name, child.filePath, child.line, vt.depth + 1, vt.id
+                    SELECT child.id, child.name, child.filePath, child.line, vt.depth + 1, vt.id, e.metadata
                     FROM view_tree vt
                     JOIN edges e ON e.sourceId = vt.id AND e.kind = ?
                     JOIN symbols child ON e.targetId = child.id
                     WHERE vt.depth < ?
                 )
-                SELECT DISTINCT id, name, filePath, line, depth, parentId FROM view_tree
+                SELECT DISTINCT id, name, filePath, line, depth, parentId, context FROM view_tree
                 ORDER BY depth, name
                 """, arguments: [root.id, EdgeKind.composesView.rawValue, maxDepth])
 
@@ -305,6 +389,167 @@ public struct QueryEngine: Sendable {
             }
 
             return results
+        }
+    }
+
+    // MARK: - find_usages
+
+    /// Find all usage sites of a symbol with file:line locations.
+    /// For types, queries the type_references table for exact call sites.
+    /// For members, shows references to the parent type as an approximation.
+    public func findUsages(
+        projectId: Int64,
+        symbolName: String
+    ) throws -> UsageResult {
+        try db.dbWriter.read { db in
+            // Try multiple lookup strategies:
+            // 1. Exact name match
+            // 2. Qualified name match (e.g., "ProfileManager.createProfile")
+            // 3. FTS prefix search as last resort
+            var symbol = try SymbolRecord
+                .filter(Column("projectId") == projectId)
+                .filter(Column("name") == symbolName)
+                .filter(Column("kind") != NodeKind.extension.rawValue)
+                .filter(Column("kind") != NodeKind.file.rawValue)
+                .filter(Column("kind") != NodeKind.module.rawValue)
+                .filter(sql: "qualifiedName NOT LIKE 'unresolved:%'")
+                .fetchOne(db)
+
+            if symbol == nil {
+                // Try qualified name match
+                symbol = try SymbolRecord
+                    .filter(Column("projectId") == projectId)
+                    .filter(Column("qualifiedName") == symbolName)
+                    .filter(sql: "qualifiedName NOT LIKE 'unresolved:%'")
+                    .fetchOne(db)
+            }
+
+            if symbol == nil {
+                // Try FTS prefix search — find suggestions
+                let suggestions = try Row.fetchAll(db, sql: """
+                    SELECT s.name, s.qualifiedName, s.kind
+                    FROM symbols s
+                    JOIN symbols_fts ON symbols_fts.rowid = s.rowid
+                    WHERE symbols_fts MATCH ?
+                    AND s.projectId = ?
+                    AND s.qualifiedName NOT LIKE 'unresolved:%'
+                    AND s.kind NOT IN ('file', 'module', 'extension')
+                    ORDER BY rank LIMIT 5
+                    """, arguments: [ftsQuery(symbolName), projectId])
+
+                let suggestionNames = suggestions.map { (row: Row) -> String in
+                    let name: String = row["name"]
+                    let qn: String = row["qualifiedName"]
+                    let kind: String = row["kind"]
+                    return "\(kind) \(qn == name ? name : qn)"
+                }
+
+                return UsageResult(symbolName: symbolName, symbolKind: "unknown",
+                                   usages: [], parentTypeName: nil,
+                                   suggestions: suggestionNames)
+            }
+
+            guard let symbol else {
+                return UsageResult(symbolName: symbolName, symbolKind: "unknown",
+                                   usages: [], parentTypeName: nil)
+            }
+
+            let typeKinds: Set<String> = ["struct", "class", "enum", "actor", "protocol", "typeAlias"]
+            let isType = typeKinds.contains(symbol.kind)
+
+            // For members, find the parent type to show type-level references
+            var parentTypeName: String? = nil
+            var lookupName = symbolName
+
+            if !isType {
+                let parentRow = try Row.fetchOne(db, sql: """
+                    SELECT s.name FROM symbols s
+                    JOIN edges e ON e.sourceId = s.id AND e.kind = ?
+                    WHERE e.targetId = ?
+                    AND s.kind IN ('struct', 'class', 'enum', 'actor', 'protocol')
+                    LIMIT 1
+                    """, arguments: [EdgeKind.contains.rawValue, symbol.id!])
+
+                if let parentRow {
+                    parentTypeName = parentRow["name"]
+                    lookupName = parentTypeName!
+                }
+            }
+
+            var usages: [UsageSite] = []
+            var seen = Set<String>()
+
+            // Type references: exact file:line usage sites from the type_references table
+            let refs = try Row.fetchAll(db, sql: """
+                SELECT tr.filePath, tr.line,
+                       sourceSym.name AS usedBy, sourceSym.kind AS usedByKind
+                FROM type_references tr
+                JOIN symbols sourceSym ON sourceSym.id = tr.sourceSymbolId
+                WHERE tr.projectId = ? AND tr.referencedTypeName = ?
+                ORDER BY tr.filePath, tr.line
+                """, arguments: [projectId, lookupName])
+
+            for row in refs {
+                let fp: String? = row["filePath"]
+                let ln: Int? = row["line"]
+                let key = "\(fp ?? ""):\(ln ?? 0)"
+                guard seen.insert(key).inserted else { continue }
+
+                usages.append(UsageSite(
+                    filePath: fp,
+                    line: ln,
+                    usedBy: row["usedBy"],
+                    usedByKind: row["usedByKind"],
+                    context: "type reference"
+                ))
+            }
+
+            // Structural edges (conformsTo, composesView, usesEnvironment, etc.)
+            // Use the original symbol's ID for types, or the parent's for members
+            let targetId: Int64
+            if isType {
+                targetId = symbol.id!
+            } else if let parentTypeName {
+                targetId = try Int64.fetchOne(db, sql: """
+                    SELECT id FROM symbols
+                    WHERE projectId = ? AND name = ? AND kind IN ('struct', 'class', 'enum', 'actor', 'protocol')
+                    AND qualifiedName NOT LIKE 'unresolved:%'
+                    LIMIT 1
+                    """, arguments: [projectId, parentTypeName]) ?? symbol.id!
+            } else {
+                targetId = symbol.id!
+            }
+
+            let edgeRows = try Row.fetchAll(db, sql: """
+                SELECT s.name, s.kind, s.filePath, s.line, e.kind AS edgeKind
+                FROM edges e
+                JOIN symbols s ON s.id = e.sourceId
+                WHERE e.targetId = ?
+                AND e.kind NOT IN ('contains', 'extends', 'references')
+                ORDER BY e.kind, s.name
+                """, arguments: [targetId])
+
+            for row in edgeRows {
+                let fp: String? = row["filePath"]
+                let ln: Int? = row["line"]
+                let key = "\(fp ?? ""):\(ln ?? 0)"
+                guard seen.insert(key).inserted else { continue }
+
+                usages.append(UsageSite(
+                    filePath: fp,
+                    line: ln,
+                    usedBy: row["name"],
+                    usedByKind: row["kind"],
+                    context: row["edgeKind"]
+                ))
+            }
+
+            return UsageResult(
+                symbolName: symbolName,
+                symbolKind: symbol.kind,
+                usages: usages,
+                parentTypeName: parentTypeName
+            )
         }
     }
 
@@ -463,16 +708,22 @@ public struct QueryEngine: Sendable {
 
     // MARK: - find_dead_code
 
-    /// Find symbols with zero incoming usage edges — potential dead code.
+    /// Find symbols with few or zero incoming usage edges — potential dead code.
+    /// When maxReferences > 0, also surfaces "near-dead" symbols with limited usage.
     public func findDeadCode(
         projectId: Int64,
-        module: String? = nil
+        module: String? = nil,
+        maxReferences: Int = 0
     ) throws -> [DeadCodeEntry] {
         try db.dbWriter.read { db in
             var sql = """
-                SELECT s.id, s.name, s.kind, s.qualifiedName, s.filePath, s.line, m.name AS moduleName
+                SELECT s.id, s.name, s.kind, s.qualifiedName, s.filePath, s.line,
+                       m.name AS moduleName,
+                       COUNT(ue.id) AS refCount
                 FROM symbols s
                 LEFT JOIN modules m ON s.moduleId = m.id
+                LEFT JOIN edges ue ON ue.targetId = s.id
+                    AND ue.kind NOT IN ('extends', 'contains')
                 WHERE s.projectId = ?
                   AND s.kind IN ('struct', 'class', 'enum', 'actor', 'function', 'typeAlias')
                   AND s.qualifiedName NOT LIKE 'unresolved:%'
@@ -482,18 +733,12 @@ public struct QueryEngine: Sendable {
                   AND NOT EXISTS (
                     SELECT 1 FROM edges ce WHERE ce.targetId = s.id AND ce.kind = 'contains'
                   )
-                  -- No usage edges (exclude extends which is structural, not usage)
-                  AND NOT EXISTS (
-                    SELECT 1 FROM edges ue
-                    WHERE ue.targetId = s.id
-                    AND ue.kind NOT IN ('extends', 'contains')
-                  )
                   -- Not @main entry point
                   AND (s.attributes IS NULL OR s.attributes NOT LIKE '%@main%')
                   -- Not in a test target (by module or file path)
                   AND NOT EXISTS (
                     SELECT 1 FROM modules tm
-                    WHERE tm.id = s.moduleId AND tm.kind = 'testTarget'
+                    WHERE tm.id = s.moduleId AND tm.kind = 'test'
                   )
                   AND (s.filePath IS NULL OR (s.filePath NOT LIKE '%/Tests/%' AND s.filePath NOT LIKE '%Tests.swift'))
                   -- Not a protocol conformer (used via its protocol, not directly)
@@ -509,7 +754,10 @@ public struct QueryEngine: Sendable {
                 arguments.append(module)
             }
 
-            sql += " ORDER BY s.kind, s.name"
+            sql += " GROUP BY s.id HAVING COUNT(ue.id) <= ?"
+            arguments.append(maxReferences)
+
+            sql += " ORDER BY COUNT(ue.id), s.kind, s.name"
 
             return try Row.fetchAll(db, sql: sql, arguments: StatementArguments(arguments))
                 .map { row in
@@ -519,7 +767,8 @@ public struct QueryEngine: Sendable {
                         qualifiedName: row["qualifiedName"],
                         filePath: row["filePath"],
                         line: row["line"],
-                        moduleName: row["moduleName"]
+                        moduleName: row["moduleName"],
+                        referenceCount: row["refCount"]
                     )
                 }
         }
@@ -680,6 +929,182 @@ public struct QueryEngine: Sendable {
             let rows = try Row.fetchAll(db, sql: cteSQL, arguments: [symbol.id, maxDepth])
             return buildImpactTree(from: rows, rootName: symbolName)
         }
+    }
+
+    // MARK: - trace_call_graph
+
+    /// Trace the call graph from a function: callers (incoming) and/or callees (outgoing).
+    /// Uses recursive CTEs for transitive call chain analysis.
+    public func traceCallGraph(
+        projectId: Int64,
+        functionName: String,
+        direction: DependencyDirection = .both,
+        maxDepth: Int = 5
+    ) throws -> CallGraphResult {
+        try db.dbWriter.read { db in
+            // Find the target function — try exact match first, then qualified name
+            var symbol = try SymbolRecord
+                .filter(Column("projectId") == projectId)
+                .filter(Column("name") == functionName)
+                .filter(Column("kind") == NodeKind.function.rawValue)
+                .fetchOne(db)
+
+            // Try initializer
+            if symbol == nil && functionName.hasPrefix("init") {
+                symbol = try SymbolRecord
+                    .filter(Column("projectId") == projectId)
+                    .filter(Column("name") == functionName)
+                    .filter(Column("kind") == NodeKind.initializer.rawValue)
+                    .fetchOne(db)
+            }
+
+            // Try qualified name match (e.g. "MovieService.fetchMovie")
+            if symbol == nil {
+                symbol = try SymbolRecord
+                    .filter(Column("projectId") == projectId)
+                    .filter(Column("qualifiedName") == functionName)
+                    .filter(Column("kind") == NodeKind.function.rawValue)
+                    .fetchOne(db)
+            }
+
+            // Fallback: any symbol with that name
+            if symbol == nil {
+                symbol = try SymbolRecord
+                    .filter(Column("projectId") == projectId)
+                    .filter(Column("name") == functionName)
+                    .filter(Column("qualifiedName").like("%.\(functionName)"))
+                    .filter([
+                        NodeKind.function.rawValue,
+                        NodeKind.initializer.rawValue,
+                        NodeKind.variable.rawValue,
+                    ].contains(Column("kind")))
+                    .fetchOne(db)
+            }
+
+            guard let symbol, let symbolId = symbol.id else {
+                return CallGraphResult(
+                    functionName: functionName,
+                    kind: "unknown",
+                    parentType: nil,
+                    filePath: nil,
+                    line: nil,
+                    callers: [],
+                    callees: []
+                )
+            }
+
+            // Get parent type name
+            let parentType: String? = try Row.fetchOne(db, sql: """
+                SELECT p.name FROM symbols p
+                JOIN edges e ON e.sourceId = p.id AND e.kind = 'contains'
+                WHERE e.targetId = ?
+                """, arguments: [symbolId])?["name"]
+
+            var callers: [CallGraphNode] = []
+            var callees: [CallGraphNode] = []
+
+            // Incoming: who calls this function (recursive)
+            if direction == .incoming || direction == .both {
+                let rows = try Row.fetchAll(db, sql: """
+                    WITH RECURSIVE call_chain(id, name, kind, filePath, line, depth, parentId, parentType, callKind) AS (
+                        SELECT s.id, s.name, s.kind, s.filePath, s.line, 0,
+                               CAST(NULL AS INTEGER), CAST(NULL AS TEXT), CAST(NULL AS TEXT)
+                        FROM symbols s WHERE s.id = ?
+
+                        UNION ALL
+
+                        SELECT caller.id, caller.name, caller.kind, caller.filePath, caller.line,
+                               cc.depth + 1, cc.id,
+                               parentSym.name,
+                               e.metadata
+                        FROM call_chain cc
+                        JOIN edges e ON e.targetId = cc.id AND e.kind = 'calls'
+                        JOIN symbols caller ON e.sourceId = caller.id
+                        LEFT JOIN edges pe ON pe.targetId = caller.id AND pe.kind = 'contains'
+                        LEFT JOIN symbols parentSym ON pe.sourceId = parentSym.id
+                        WHERE cc.depth < ?
+                    )
+                    SELECT DISTINCT id, name, kind, filePath, line, depth, parentId, parentType, callKind
+                    FROM call_chain
+                    WHERE depth > 0
+                    ORDER BY depth, name
+                    """, arguments: [symbolId, maxDepth])
+
+                callers = buildCallNodes(from: rows)
+            }
+
+            // Outgoing: what does this function call (recursive)
+            if direction == .outgoing || direction == .both {
+                let rows = try Row.fetchAll(db, sql: """
+                    WITH RECURSIVE call_chain(id, name, kind, filePath, line, depth, parentId, parentType, callKind) AS (
+                        SELECT s.id, s.name, s.kind, s.filePath, s.line, 0,
+                               CAST(NULL AS INTEGER), CAST(NULL AS TEXT), CAST(NULL AS TEXT)
+                        FROM symbols s WHERE s.id = ?
+
+                        UNION ALL
+
+                        SELECT callee.id, callee.name, callee.kind, callee.filePath, callee.line,
+                               cc.depth + 1, cc.id,
+                               parentSym.name,
+                               e.metadata
+                        FROM call_chain cc
+                        JOIN edges e ON e.sourceId = cc.id AND e.kind = 'calls'
+                        JOIN symbols callee ON e.targetId = callee.id
+                        LEFT JOIN edges pe ON pe.targetId = callee.id AND pe.kind = 'contains'
+                        LEFT JOIN symbols parentSym ON pe.sourceId = parentSym.id
+                        WHERE cc.depth < ?
+                    )
+                    SELECT DISTINCT id, name, kind, filePath, line, depth, parentId, parentType, callKind
+                    FROM call_chain
+                    WHERE depth > 0
+                    ORDER BY depth, name
+                    """, arguments: [symbolId, maxDepth])
+
+                callees = buildCallNodes(from: rows)
+            }
+
+            return CallGraphResult(
+                functionName: functionName,
+                kind: symbol.kind,
+                parentType: parentType,
+                filePath: symbol.filePath,
+                line: symbol.line,
+                callers: callers,
+                callees: callees
+            )
+        }
+    }
+
+    private func buildCallNodes(from rows: [Row]) -> [CallGraphNode] {
+        var nodes: [CallGraphNode] = []
+        var seen = Set<Int64>()
+
+        for row in rows {
+            let id: Int64 = row["id"]
+            guard seen.insert(id).inserted else { continue }
+
+            let depth: Int = row["depth"]
+            let parentType: String? = row["parentType"]
+            let name: String = row["name"]
+
+            let displayName: String
+            if let parentType {
+                displayName = parentType + "." + name
+            } else {
+                displayName = name
+            }
+
+            nodes.append(CallGraphNode(
+                name: displayName,
+                kind: row["kind"],
+                filePath: row["filePath"],
+                line: row["line"],
+                depth: depth,
+                callKind: row["callKind"]
+            ))
+        }
+
+        return nodes
     }
 
     // MARK: - check_environment_injection
@@ -903,6 +1328,241 @@ public struct QueryEngine: Sendable {
         }
     }
 
+    // MARK: - cross_module_usage
+
+    /// Find which specific types from other modules a given module uses.
+    public func crossModuleUsage(
+        projectId: Int64,
+        module: String,
+        targetModule: String? = nil
+    ) throws -> CrossModuleResult {
+        try db.dbWriter.read { db in
+            // Find all type references originating from the source module,
+            // resolving modules via moduleId or file path fallback.
+            let rows = try Row.fetchAll(db, sql: """
+                SELECT tr.referencedTypeName,
+                       target_sym.kind AS targetKind,
+                       target_sym.filePath AS targetFile,
+                       target_sym.line AS targetLine,
+                       COALESCE(tm.name, tmf.name) AS targetModule,
+                       COUNT(*) AS usageCount
+                FROM type_references tr
+                JOIN symbols src ON src.id = tr.sourceSymbolId
+                LEFT JOIN modules sm ON sm.id = src.moduleId
+                LEFT JOIN modules smf ON smf.projectId = src.projectId
+                    AND src.moduleId IS NULL AND smf.path IS NOT NULL
+                    AND src.filePath LIKE '%/' || smf.path || '/%'
+                JOIN symbols target_sym ON target_sym.projectId = tr.projectId
+                    AND target_sym.name = tr.referencedTypeName
+                    AND target_sym.kind IN ('struct', 'class', 'enum', 'protocol', 'actor', 'typeAlias')
+                    AND target_sym.qualifiedName NOT LIKE 'unresolved:%'
+                LEFT JOIN modules tm ON tm.id = target_sym.moduleId
+                LEFT JOIN modules tmf ON tmf.projectId = target_sym.projectId
+                    AND target_sym.moduleId IS NULL AND tmf.path IS NOT NULL
+                    AND target_sym.filePath LIKE '%/' || tmf.path || '/%'
+                WHERE tr.projectId = ?
+                    AND COALESCE(sm.name, smf.name) = ?
+                    AND COALESCE(tm.name, tmf.name) IS NOT NULL
+                    AND COALESCE(tm.name, tmf.name) != COALESCE(sm.name, smf.name)
+                GROUP BY tr.referencedTypeName, target_sym.kind,
+                         COALESCE(tm.name, tmf.name)
+                ORDER BY COALESCE(tm.name, tmf.name), usageCount DESC
+                """, arguments: [projectId, module])
+
+            var byModule: [String: [CrossModuleEntry]] = [:]
+            for row in rows {
+                let targetMod: String = row["targetModule"]
+                if let filter = targetModule, targetMod != filter { continue }
+                let entry = CrossModuleEntry(
+                    typeName: row["referencedTypeName"],
+                    kind: row["targetKind"],
+                    filePath: row["targetFile"],
+                    line: row["targetLine"],
+                    usageCount: row["usageCount"]
+                )
+                byModule[targetMod, default: []].append(entry)
+            }
+
+            let modules = byModule.map { (name, entries) in
+                CrossModuleDependency(moduleName: name, types: entries)
+            }.sorted { $0.types.count > $1.types.count }
+
+            let totalTypes = modules.reduce(0) { $0 + $1.types.count }
+            return CrossModuleResult(
+                sourceModule: module,
+                totalCrossModuleTypes: totalTypes,
+                dependencies: modules
+            )
+        }
+    }
+
+    // MARK: - test_coverage
+
+    /// Find which production types have tests and which don't.
+    /// Uses naming conventions (FooTests → Foo) and type reference analysis.
+    public func testCoverage(
+        projectId: Int64,
+        module: String? = nil
+    ) throws -> TestCoverageResult {
+        try db.dbWriter.read { db in
+            // 1. Find test classes by module kind or file path heuristic
+            let testClassRows = try Row.fetchAll(db, sql: """
+                SELECT s.name, s.inheritedTypes, s.attributes
+                FROM symbols s
+                WHERE s.projectId = ?
+                    AND s.kind IN ('struct', 'class')
+                    AND s.qualifiedName NOT LIKE 'unresolved:%'
+                    AND (
+                        s.moduleId IN (SELECT id FROM modules WHERE projectId = ? AND kind = 'test')
+                        OR s.filePath LIKE '%/Tests/%'
+                    )
+                """, arguments: [projectId, projectId])
+
+            // Build naming convention map: production name → test class name
+            var testedByNaming: [String: String] = [:]
+            for row in testClassRows {
+                let name: String = row["name"]
+                // FooTests → Foo
+                if name.hasSuffix("Tests") {
+                    let productionName = String(name.dropLast(5))
+                    if !productionName.isEmpty {
+                        testedByNaming[productionName] = name
+                    }
+                } else if name.hasSuffix("Test") {
+                    let productionName = String(name.dropLast(4))
+                    if !productionName.isEmpty {
+                        testedByNaming[productionName] = name
+                    }
+                } else if name.hasSuffix("Spec") {
+                    let productionName = String(name.dropLast(4))
+                    if !productionName.isEmpty {
+                        testedByNaming[productionName] = name
+                    }
+                }
+            }
+
+            // 2. Find all type names referenced from test files
+            let refRows = try Row.fetchAll(db, sql: """
+                SELECT DISTINCT tr.referencedTypeName
+                FROM type_references tr
+                WHERE tr.projectId = ?
+                    AND (
+                        EXISTS (
+                            SELECT 1 FROM symbols s
+                            WHERE s.id = tr.sourceSymbolId
+                            AND (
+                                s.moduleId IN (SELECT id FROM modules WHERE projectId = ? AND kind = 'test')
+                                OR s.filePath LIKE '%/Tests/%'
+                            )
+                        )
+                        OR tr.filePath LIKE '%/Tests/%'
+                    )
+                """, arguments: [projectId, projectId])
+
+            var referencedFromTests: Set<String> = []
+            for row in refRows {
+                let name: String = row["referencedTypeName"]
+                referencedFromTests.insert(name)
+            }
+
+            // 3. Get all production types (not in test targets, not members, not CodingKeys)
+            // JOIN modules via moduleId when available, else fall back to file path matching
+            var sql = """
+                SELECT s.id, s.name, s.qualifiedName, s.kind, s.filePath, s.line,
+                       s.accessLevel, s.inheritedTypes,
+                       COALESCE(m.name, mf.name) AS moduleName
+                FROM symbols s
+                LEFT JOIN modules m ON s.moduleId = m.id
+                LEFT JOIN modules mf ON mf.projectId = s.projectId
+                    AND s.moduleId IS NULL
+                    AND mf.path IS NOT NULL
+                    AND s.filePath LIKE '%/' || mf.path || '/%'
+                WHERE s.projectId = ?
+                    AND s.kind IN ('struct', 'class', 'enum', 'protocol', 'actor')
+                    AND s.qualifiedName NOT LIKE 'unresolved:%'
+                    AND s.name != 'CodingKeys'
+                    AND (s.moduleId IS NULL OR s.moduleId NOT IN (
+                        SELECT id FROM modules WHERE projectId = ? AND kind = 'test'
+                    ))
+                    AND (s.filePath IS NULL OR s.filePath NOT LIKE '%/Tests/%')
+                """
+            var arguments: [any DatabaseValueConvertible] = [projectId, projectId]
+
+            if let module {
+                sql += " AND COALESCE(m.name, mf.name) = ?"
+                arguments.append(module)
+            }
+
+            sql += " ORDER BY s.name"
+
+            let productionRows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(arguments))
+
+            var tested: [TestCoverageEntry] = []
+            var untested: [TestCoverageEntry] = []
+
+            for row in productionRows {
+                let name: String = row["name"]
+                let kind: String = row["kind"]
+                let filePath: String? = row["filePath"]
+                let line: Int? = row["line"]
+                let moduleName: String? = row["moduleName"]
+                let inheritedJSON: String? = row["inheritedTypes"]
+
+                // Detect View conformers
+                let isView: Bool
+                if let json = inheritedJSON {
+                    isView = json.contains("\"View\"")
+                } else {
+                    isView = false
+                }
+
+                let testClassName = testedByNaming[name]
+                let isReferencedByTest = referencedFromTests.contains(name)
+
+                let entry = TestCoverageEntry(
+                    name: name,
+                    kind: kind,
+                    filePath: filePath,
+                    line: line,
+                    moduleName: moduleName,
+                    testedBy: testClassName ?? (isReferencedByTest ? "(referenced)" : nil),
+                    isView: isView
+                )
+
+                if testClassName != nil || isReferencedByTest {
+                    tested.append(entry)
+                } else {
+                    untested.append(entry)
+                }
+            }
+
+            let total = tested.count + untested.count
+            let coveragePercent = total > 0 ? Double(tested.count) / Double(total) * 100.0 : 0.0
+
+            // Compute logic-only coverage (excluding View types)
+            let logicTested = tested.filter { !$0.isView }
+            let logicUntested = untested.filter { !$0.isView }
+            let logicTotal = logicTested.count + logicUntested.count
+            let logicCoveragePercent = logicTotal > 0
+                ? Double(logicTested.count) / Double(logicTotal) * 100.0 : 0.0
+
+            let viewCount = tested.filter(\.isView).count + untested.filter(\.isView).count
+
+            return TestCoverageResult(
+                totalProductionTypes: total,
+                testedCount: tested.count,
+                untestedCount: untested.count,
+                coveragePercent: coveragePercent,
+                logicTypes: logicTotal,
+                logicTestedCount: logicTested.count,
+                logicCoveragePercent: logicCoveragePercent,
+                viewTypes: viewCount,
+                untested: untested,
+                tested: tested
+            )
+        }
+    }
+
     // MARK: - Helpers
 
     private func ftsQuery(_ query: String) -> String {
@@ -915,7 +1575,7 @@ public struct QueryEngine: Sendable {
 
     private func buildViewTree(from rows: [Row], rootName: String) -> ViewTreeNode {
         guard let rootRow = rows.first else {
-            return ViewTreeNode(name: rootName, filePath: nil, line: nil, children: [])
+            return ViewTreeNode(name: rootName, filePath: nil, line: nil, context: nil, children: [])
         }
 
         // Collect node data and parent→children mapping
@@ -923,6 +1583,7 @@ public struct QueryEngine: Sendable {
             let name: String
             let filePath: String?
             let line: Int?
+            let context: String?
         }
 
         var nodeData: [Int64: NodeData] = [:]
@@ -936,7 +1597,8 @@ public struct QueryEngine: Sendable {
             nodeData[id] = NodeData(
                 name: row["name"],
                 filePath: row["filePath"],
-                line: row["line"]
+                line: row["line"],
+                context: row["context"]
             )
 
             let parentId: Int64? = row["parentId"]
@@ -954,6 +1616,7 @@ public struct QueryEngine: Sendable {
                 name: data.name,
                 filePath: data.filePath,
                 line: data.line,
+                context: data.context,
                 children: children
             )
         }
@@ -1075,6 +1738,7 @@ public struct ViewTreeNode: Sendable {
     public let name: String
     public let filePath: String?
     public let line: Int?
+    public let context: String?
     public let children: [ViewTreeNode]
 }
 
@@ -1142,6 +1806,7 @@ public struct DeadCodeEntry: Sendable {
     public let filePath: String?
     public let line: Int?
     public let moduleName: String?
+    public let referenceCount: Int
 }
 
 // MARK: - Protocol Coverage Types
@@ -1178,6 +1843,27 @@ public struct ImpactNode: Sendable {
     public let children: [ImpactNode]
 }
 
+// MARK: - Call Graph Types
+
+public struct CallGraphResult: Sendable {
+    public let functionName: String
+    public let kind: String
+    public let parentType: String?
+    public let filePath: String?
+    public let line: Int?
+    public let callers: [CallGraphNode]
+    public let callees: [CallGraphNode]
+}
+
+public struct CallGraphNode: Sendable {
+    public let name: String        // Qualified: ParentType.methodName
+    public let kind: String
+    public let filePath: String?
+    public let line: Int?
+    public let depth: Int
+    public let callKind: String?   // selfCall, staticCall, etc.
+}
+
 // MARK: - Environment Injection Check Types
 
 public enum InjectionStatus: Sendable {
@@ -1195,6 +1881,24 @@ public struct EnvironmentInjectionCheck: Sendable {
     public let injectedBy: String?
 }
 
+// MARK: - Usage Result Types
+
+public struct UsageResult: Sendable {
+    public let symbolName: String
+    public let symbolKind: String
+    public let usages: [UsageSite]
+    public let parentTypeName: String? // set when showing parent type refs for a member
+    public var suggestions: [String]? // set when symbol not found, with similar names
+}
+
+public struct UsageSite: Sendable {
+    public let filePath: String?
+    public let line: Int?
+    public let usedBy: String       // enclosing type/symbol name
+    public let usedByKind: String   // kind of the enclosing symbol
+    public let context: String      // "type reference", "conformsTo", "composesView", etc.
+}
+
 // MARK: - Access Control Audit Types
 
 public struct AccessControlIssue: Sendable {
@@ -1206,4 +1910,82 @@ public struct AccessControlIssue: Sendable {
     public let filePath: String?
     public let line: Int?
     public let moduleName: String?
+}
+
+// MARK: - Diff Since Types
+
+public enum ChangeStatus: String, Sendable {
+    case added
+    case removed
+    case modified
+}
+
+public struct DiffSinceResult: Sendable {
+    public let commit: String
+    public let filesChanged: Int
+    public let added: [SymbolChange]
+    public let removed: [SymbolChange]
+    public let modified: [SymbolChange]
+}
+
+public struct SymbolChange: Sendable {
+    public let name: String
+    public let kind: String
+    public let filePath: String?
+    public let line: Int?
+    public let detail: String?
+
+    public init(name: String, kind: String, filePath: String?, line: Int?, detail: String?) {
+        self.name = name
+        self.kind = kind
+        self.filePath = filePath
+        self.line = line
+        self.detail = detail
+    }
+}
+
+// MARK: - Test Coverage Types
+
+public struct TestCoverageResult: Sendable {
+    public let totalProductionTypes: Int
+    public let testedCount: Int
+    public let untestedCount: Int
+    public let coveragePercent: Double
+    public let logicTypes: Int
+    public let logicTestedCount: Int
+    public let logicCoveragePercent: Double
+    public let viewTypes: Int
+    public let untested: [TestCoverageEntry]
+    public let tested: [TestCoverageEntry]
+}
+
+public struct TestCoverageEntry: Sendable {
+    public let name: String
+    public let kind: String
+    public let filePath: String?
+    public let line: Int?
+    public let moduleName: String?
+    public let testedBy: String? // test class name, or "(referenced)" for ref-only
+    public let isView: Bool
+}
+
+// MARK: - Cross-Module Usage Types
+
+public struct CrossModuleResult: Sendable {
+    public let sourceModule: String
+    public let totalCrossModuleTypes: Int
+    public let dependencies: [CrossModuleDependency]
+}
+
+public struct CrossModuleDependency: Sendable {
+    public let moduleName: String
+    public let types: [CrossModuleEntry]
+}
+
+public struct CrossModuleEntry: Sendable {
+    public let typeName: String
+    public let kind: String
+    public let filePath: String?
+    public let line: Int?
+    public let usageCount: Int
 }

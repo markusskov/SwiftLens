@@ -18,6 +18,10 @@ struct ToolHandlers: Sendable {
             return try handleSearchSymbol(args)
         case "get_symbol":
             return try handleGetSymbol(args)
+        case "symbols_in_file":
+            return try handleSymbolsInFile(args)
+        case "find_usages":
+            return try handleFindUsages(args)
         case "find_conformers":
             return try handleFindConformers(args)
         case "get_module_graph":
@@ -31,7 +35,7 @@ struct ToolHandlers: Sendable {
         case "find_dependencies":
             return try handleFindDependencies(args)
         case "reindex":
-            return try await handleReindex()
+            return try await handleReindex(args)
         case "find_dead_code":
             return try handleFindDeadCode(args)
         case "check_protocol_coverage":
@@ -42,6 +46,14 @@ struct ToolHandlers: Sendable {
             return try handleCheckEnvironmentInjection()
         case "audit_access_control":
             return try handleAuditAccessControl(args)
+        case "diff_since":
+            return try handleDiffSince(args)
+        case "test_coverage":
+            return try handleTestCoverage(args)
+        case "cross_module_usage":
+            return try handleCrossModuleUsage(args)
+        case "trace_call_graph":
+            return try handleTraceCallGraph(args)
         default:
             return CallTool.Result(
                 content: [.text("Unknown tool: \(params.name)")],
@@ -53,8 +65,11 @@ struct ToolHandlers: Sendable {
     // MARK: - Individual Handlers
 
     private func handleSearchSymbol(_ args: [String: Value]) throws -> CallTool.Result {
-        guard let query = args["query"]?.stringValue else {
-            return CallTool.Result(content: [.text("Missing required parameter: query")], isError: true)
+        let query = args["query"]?.stringValue
+        let attribute = args["attribute"]?.stringValue
+
+        guard query != nil || attribute != nil else {
+            return CallTool.Result(content: [.text("At least one of 'query' or 'attribute' must be provided.")], isError: true)
         }
 
         let kind = args["kind"]?.stringValue.flatMap { NodeKind(rawValue: $0) }
@@ -66,14 +81,26 @@ struct ToolHandlers: Sendable {
             query: query,
             kind: kind,
             module: module,
+            attribute: attribute,
             limit: limit
         )
 
         if results.isEmpty {
-            return CallTool.Result(content: [.text("No symbols found matching '\(query)'")])
+            var desc = ""
+            if let query { desc += "'\(query)'" }
+            if let attribute { desc += (desc.isEmpty ? "" : " with ") + "@\(attribute.hasPrefix("@") ? String(attribute.dropFirst()) : attribute)" }
+            return CallTool.Result(content: [.text("No symbols found matching \(desc)")])
         }
 
-        var output = "Found \(results.count) symbol(s):\n\n"
+        var header = "Found \(results.count) symbol(s)"
+        if let attribute {
+            let normalized = attribute.hasPrefix("@") ? attribute : "@" + attribute
+            header += " with \(normalized)"
+        }
+        if let query { header += " matching '\(query)'" }
+        header += ":\n\n"
+
+        var output = header
         for r in results {
             output += "  \(r.kind) \(r.qualifiedName)"
             if let mod = r.moduleName { output += " [\(mod)]" }
@@ -108,6 +135,84 @@ struct ToolHandlers: Sendable {
         }
 
         let output = formatSymbolDetail(detail)
+        return CallTool.Result(content: [.text(output)])
+    }
+
+    private func handleSymbolsInFile(_ args: [String: Value]) throws -> CallTool.Result {
+        guard let filePath = args["file_path"]?.stringValue else {
+            return CallTool.Result(content: [.text("Missing required parameter: file_path")], isError: true)
+        }
+
+        // Resolve relative paths against project root
+        let resolvedPath: String
+        if filePath.hasPrefix("/") {
+            resolvedPath = filePath
+        } else {
+            resolvedPath = projectRoot + "/" + filePath
+        }
+
+        let kind = args["kind"]?.stringValue.flatMap { NodeKind(rawValue: $0) }
+
+        let results = try queryEngine.symbolsInFile(
+            projectId: projectId,
+            filePath: resolvedPath,
+            kind: kind
+        )
+
+        if results.isEmpty {
+            return CallTool.Result(content: [.text("No symbols found in '\(shortenPath(resolvedPath))'")])
+        }
+
+        var output = "Symbols in \(shortenPath(resolvedPath)) (\(results.count)):\n\n"
+        for r in results {
+            output += "  L\(r.line ?? 0) \(r.kind) \(r.name)"
+            if let access = r.accessLevel { output += " (\(access))" }
+            if let sig = r.signature { output += " \(sig)" }
+            output += "\n"
+        }
+        return CallTool.Result(content: [.text(output)])
+    }
+
+    private func handleFindUsages(_ args: [String: Value]) throws -> CallTool.Result {
+        guard let symbol = args["symbol"]?.stringValue else {
+            return CallTool.Result(content: [.text("Missing required parameter: symbol")], isError: true)
+        }
+
+        let result = try queryEngine.findUsages(projectId: projectId, symbolName: symbol)
+
+        if result.usages.isEmpty {
+            if result.symbolKind == "unknown" {
+                var msg = "Symbol '\(symbol)' not found."
+                if let suggestions = result.suggestions, !suggestions.isEmpty {
+                    msg += " Did you mean:\n" + suggestions.map { "  - \($0)" }.joined(separator: "\n")
+                }
+                return CallTool.Result(content: [.text(msg)])
+            }
+            return CallTool.Result(content: [.text("No usages found for \(result.symbolKind) '\(symbol)'")])
+        }
+
+        var output = "Usages of \(result.symbolKind) \(symbol) (\(result.usages.count) sites):\n"
+
+        if let parent = result.parentTypeName {
+            output += "  (member of \(parent) — showing references to parent type)\n"
+        }
+
+        // Group by file for readability
+        let grouped = Dictionary(grouping: result.usages) { $0.filePath ?? "<unknown>" }
+        let sortedFiles = grouped.keys.sorted()
+
+        for file in sortedFiles {
+            let sites = grouped[file]!
+            output += "\n  \(shortenPath(file)):\n"
+            for site in sites {
+                output += "    L\(site.line ?? 0) — \(site.usedByKind) \(site.usedBy)"
+                if site.context != "type reference" {
+                    output += " [\(site.context)]"
+                }
+                output += "\n"
+            }
+        }
+
         return CallTool.Result(content: [.text(output)])
     }
 
@@ -281,41 +386,72 @@ struct ToolHandlers: Sendable {
         return CallTool.Result(content: [.text(output)])
     }
 
-    private func handleReindex() async throws -> CallTool.Result {
+    private func handleReindex(_ args: [String: Value]) async throws -> CallTool.Result {
+        let force = args["force"]?.boolValue ?? false
         let result = try await indexingCoordinator.index(
             projectRoot: projectRoot,
-            config: projectConfig
+            config: projectConfig,
+            force: force
         )
 
+        let mode = force ? "Full reindex" : "Reindex"
         let output = """
-            Reindex complete:
-              Total files: \(result.totalFiles)
-              Files indexed: \(result.indexedFiles)
-              Files deleted: \(result.deletedFiles)
+            \(mode) complete:
+              Files: \(result.totalFiles) total, \(result.indexedFiles) re-parsed, \(result.deletedFiles) deleted
               Modules: \(result.modules)
+              Symbols: \(result.totalSymbols)
+              Edges: \(result.totalEdges)
             """
         return CallTool.Result(content: [.text(output)])
     }
 
     private func handleFindDeadCode(_ args: [String: Value]) throws -> CallTool.Result {
         let module = args["module"]?.stringValue
+        let maxRefs = args["max_references"]?.intValue ?? 0
 
-        let results = try queryEngine.findDeadCode(projectId: projectId, module: module)
+        let results = try queryEngine.findDeadCode(
+            projectId: projectId,
+            module: module,
+            maxReferences: maxRefs
+        )
 
         if results.isEmpty {
-            return CallTool.Result(content: [.text("No dead code found — all symbols have incoming references.")])
+            let msg = maxRefs == 0
+                ? "No dead code found — all symbols have incoming references."
+                : "No symbols found with \(maxRefs) or fewer references."
+            return CallTool.Result(content: [.text(msg)])
         }
 
-        var output = "Potentially dead code (\(results.count) symbols):\n\n"
-        for entry in results {
-            output += "  \(entry.kind) \(entry.name)"
-            if let mod = entry.moduleName { output += " [\(mod)]" }
-            if let path = entry.filePath, let line = entry.line {
-                output += " — \(shortenPath(path)):\(line)"
+        let dead = results.filter { $0.referenceCount == 0 }
+        let nearDead = results.filter { $0.referenceCount > 0 }
+
+        var output = ""
+
+        if !dead.isEmpty {
+            output += "DEAD CODE — 0 references (\(dead.count)):\n\n"
+            for entry in dead {
+                output += "  \(entry.kind) \(entry.name)"
+                if let mod = entry.moduleName { output += " [\(mod)]" }
+                if let path = entry.filePath, let line = entry.line {
+                    output += " — \(shortenPath(path)):\(line)"
+                }
+                output += "\n"
             }
-            output += "\n"
         }
-        output += "\nNote: These symbols have no incoming structural edges (conformsTo, inherits, composesView, usesEnvironment). Symbols used only via runtime reflection or string-based lookup may be false positives."
+
+        if !nearDead.isEmpty {
+            output += "\nNEAR-DEAD CODE — 1-\(maxRefs) reference(s) (\(nearDead.count)):\n\n"
+            for entry in nearDead {
+                output += "  \(entry.kind) \(entry.name) [\(entry.referenceCount) ref]"
+                if let mod = entry.moduleName { output += " [\(mod)]" }
+                if let path = entry.filePath, let line = entry.line {
+                    output += " — \(shortenPath(path)):\(line)"
+                }
+                output += "\n"
+            }
+        }
+
+        output += "\nNote: Symbols used only via runtime reflection or string-based lookup may be false positives."
         return CallTool.Result(content: [.text(output)])
     }
 
@@ -480,6 +616,344 @@ struct ToolHandlers: Sendable {
         return CallTool.Result(content: [.text(output)])
     }
 
+    private func handleDiffSince(_ args: [String: Value]) throws -> CallTool.Result {
+        guard let commit = args["commit"]?.stringValue else {
+            return CallTool.Result(content: [.text("Missing required parameter: commit")], isError: true)
+        }
+
+        let limit = args["limit"]?.intValue ?? 100
+        let unlimited = limit == 0
+
+        // 1. Get changed files with status
+        let diffOutput: String
+        do {
+            diffOutput = try runGit(["diff", "--name-status", commit, "--", "*.swift"], at: projectRoot)
+        } catch {
+            return CallTool.Result(
+                content: [.text("Git error: \(error.localizedDescription)\nMake sure '\(commit)' is a valid git ref.")],
+                isError: true
+            )
+        }
+
+        guard !diffOutput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return CallTool.Result(content: [.text("No Swift file changes since '\(commit)'.")])
+        }
+
+        var addedFiles: [String] = []
+        var modifiedFiles: [String] = []
+        var deletedFiles: [String] = []
+
+        for line in diffOutput.split(separator: "\n") {
+            let parts = line.split(separator: "\t", maxSplits: 1)
+            guard parts.count >= 2 else { continue }
+            let status = parts[0]
+            // For renames (R###), take the new path (second tab-separated value)
+            let filePart: String
+            if status.hasPrefix("R") {
+                let renameParts = line.split(separator: "\t")
+                guard renameParts.count >= 3 else { continue }
+                filePart = String(renameParts[2])
+            } else {
+                filePart = String(parts[1])
+            }
+            let file = projectRoot + "/" + filePart
+
+            switch status.first {
+            case "A": addedFiles.append(file)
+            case "M": modifiedFiles.append(file)
+            case "D": deletedFiles.append(file)
+            case "R": modifiedFiles.append(file)
+            default: break
+            }
+        }
+
+        let totalFiles = addedFiles.count + modifiedFiles.count + deletedFiles.count
+
+        // 2. Get current symbols in added + modified files
+        var currentSymbolsByFile: [String: [SymbolSearchResult]] = [:]
+        for file in addedFiles + modifiedFiles {
+            let symbols = try queryEngine.symbolsInFile(projectId: projectId, filePath: file)
+            currentSymbolsByFile[file] = symbols
+        }
+
+        // 3. Parse old versions of modified + deleted files
+        let indexer = SwiftFileIndexer()
+        var oldSymbolsByFile: [String: [ExtractedDeclaration]] = [:]
+        for file in modifiedFiles + deletedFiles {
+            let relativePath = file.hasPrefix(projectRoot)
+                ? String(file.dropFirst(projectRoot.count + 1))
+                : file
+            if let oldSource = try? runGit(["show", "\(commit):\(relativePath)"], at: projectRoot) {
+                let extraction = indexer.index(source: oldSource, filePath: file)
+                // Filter out extensions, files, modules — only real declarations
+                oldSymbolsByFile[file] = extraction.declarations.filter {
+                    $0.kind != .extension && $0.kind != .file && $0.kind != .module
+                }
+            }
+        }
+
+        // 4. Compute diff
+        var added: [SymbolChange] = []
+        var removed: [SymbolChange] = []
+        var modified: [SymbolChange] = []
+
+        // Added files: all current symbols are new
+        for file in addedFiles {
+            for sym in currentSymbolsByFile[file] ?? [] {
+                guard sym.kind != "extension" && sym.kind != "file" && sym.kind != "module" else { continue }
+                added.append(SymbolChange(
+                    name: sym.qualifiedName, kind: sym.kind,
+                    filePath: file, line: sym.line, detail: sym.signature
+                ))
+            }
+        }
+
+        // Deleted files: all old symbols are removed
+        for file in deletedFiles {
+            for decl in oldSymbolsByFile[file] ?? [] {
+                removed.append(SymbolChange(
+                    name: decl.parent != nil ? decl.parent! + "." + decl.name : decl.name,
+                    kind: decl.kind.rawValue,
+                    filePath: file, line: decl.line, detail: decl.signature
+                ))
+            }
+        }
+
+        // Modified files: compare old vs new
+        for file in modifiedFiles {
+            let oldDecls = oldSymbolsByFile[file] ?? []
+            let newSyms = currentSymbolsByFile[file] ?? []
+
+            // Build lookup keys: (name, kind, parent) → symbol
+            struct SymbolKey: Hashable {
+                let name: String
+                let kind: String
+                let parent: String?
+            }
+
+            var oldByKey: [SymbolKey: ExtractedDeclaration] = [:]
+            for decl in oldDecls {
+                let key = SymbolKey(name: decl.name, kind: decl.kind.rawValue, parent: decl.parent)
+                oldByKey[key] = decl
+            }
+
+            var newByKey: [SymbolKey: SymbolSearchResult] = [:]
+            for sym in newSyms {
+                guard sym.kind != "extension" && sym.kind != "file" && sym.kind != "module" else { continue }
+                // Extract parent from qualifiedName (e.g. "Parent.child" → "Parent")
+                let parent: String? = sym.qualifiedName.contains(".")
+                    ? String(sym.qualifiedName.split(separator: ".").dropLast().joined(separator: "."))
+                    : nil
+                let key = SymbolKey(name: sym.name, kind: sym.kind, parent: parent)
+                newByKey[key] = sym
+            }
+
+            // Added: in new but not in old
+            for (key, sym) in newByKey where oldByKey[key] == nil {
+                added.append(SymbolChange(
+                    name: sym.qualifiedName, kind: sym.kind,
+                    filePath: file, line: sym.line, detail: sym.signature
+                ))
+            }
+
+            // Removed: in old but not in new
+            for (key, decl) in oldByKey where newByKey[key] == nil {
+                removed.append(SymbolChange(
+                    name: decl.parent != nil ? decl.parent! + "." + decl.name : decl.name,
+                    kind: decl.kind.rawValue,
+                    filePath: file, line: decl.line, detail: decl.signature
+                ))
+            }
+
+            // Modified: in both but signature changed
+            for (key, newSym) in newByKey {
+                guard let oldDecl = oldByKey[key] else { continue }
+                if oldDecl.signature != newSym.signature {
+                    let detail: String
+                    if let oldSig = oldDecl.signature, let newSig = newSym.signature {
+                        detail = oldSig + " → " + newSig
+                    } else if let newSig = newSym.signature {
+                        detail = "(none) → " + newSig
+                    } else if let oldSig = oldDecl.signature {
+                        detail = oldSig + " → (none)"
+                    } else {
+                        continue // Both nil, not really modified
+                    }
+                    modified.append(SymbolChange(
+                        name: newSym.qualifiedName, kind: newSym.kind,
+                        filePath: file, line: newSym.line, detail: detail
+                    ))
+                }
+            }
+        }
+
+        // 5. Format output
+        let totalChanges = added.count + removed.count + modified.count
+        if totalChanges == 0 {
+            return CallTool.Result(content: [.text("No symbol-level changes since '\(commit)' (\(totalFiles) files changed, but no declaration differences).")])
+        }
+
+        var output = "Changes since '\(commit)' — \(totalFiles) files, \(totalChanges) symbol changes:\n"
+
+        func formatSection(_ label: String, _ prefix: String, _ symbols: [SymbolChange]) {
+            guard !symbols.isEmpty else { return }
+            let sorted = symbols.sorted { $0.name < $1.name }
+            let capped = unlimited ? sorted : Array(sorted.prefix(limit))
+            output += "\n\(label) (\(symbols.count)):\n"
+            for sym in capped {
+                output += "  \(prefix) \(sym.kind) \(sym.name)"
+                if let path = sym.filePath, let line = sym.line {
+                    output += " — \(shortenPath(path)):\(line)"
+                }
+                if let detail = sym.detail {
+                    if prefix == "~" {
+                        output += "\n    \(detail)"
+                    } else {
+                        output += " \(detail)"
+                    }
+                }
+                output += "\n"
+            }
+            if capped.count < symbols.count {
+                output += "  ... and \(symbols.count - capped.count) more (use limit=0 for full list)\n"
+            }
+        }
+
+        formatSection("ADDED", "+", added)
+        formatSection("REMOVED", "-", removed)
+        formatSection("MODIFIED", "~", modified)
+
+        return CallTool.Result(content: [.text(output)])
+    }
+
+    private func handleTestCoverage(_ args: [String: Value]) throws -> CallTool.Result {
+        let module = args["module"]?.stringValue
+        let showTested = args["show_tested"]?.boolValue ?? false
+
+        let result = try queryEngine.testCoverage(
+            projectId: projectId,
+            module: module
+        )
+
+        if result.totalProductionTypes == 0 {
+            return CallTool.Result(content: [.text("No production types found." + (module != nil ? " Check module name." : ""))])
+        }
+
+        let pct = String(format: "%.1f", result.coveragePercent)
+        let logicPct = String(format: "%.1f", result.logicCoveragePercent)
+        var output = "Test Coverage"
+        if let module { output += " [\(module)]" }
+        output += ":\n"
+        output += "  All types: \(result.totalProductionTypes) total, \(result.testedCount) tested (\(pct)%)\n"
+        output += "  Logic types: \(result.logicTypes) total, \(result.logicTestedCount) tested (\(logicPct)%)\n"
+        output += "  View types: \(result.viewTypes) (excluded from logic coverage)\n"
+
+        if !result.untested.isEmpty {
+            output += "\nUNTESTED (\(result.untestedCount)):\n"
+
+            // Group by module
+            let grouped = Dictionary(grouping: result.untested) { $0.moduleName ?? "(no module)" }
+            let sortedModules = grouped.keys.sorted()
+
+            for mod in sortedModules {
+                let entries = grouped[mod]!
+                if sortedModules.count > 1 {
+                    output += "\n  [\(mod)]:\n"
+                }
+                let logicEntries = entries.filter { !$0.isView }
+                let viewEntries = entries.filter(\.isView)
+                for entry in logicEntries {
+                    output += "  \(entry.kind) \(entry.name)"
+                    if let path = entry.filePath, let line = entry.line {
+                        output += " — \(shortenPath(path)):\(line)"
+                    }
+                    output += "\n"
+                }
+                if !viewEntries.isEmpty {
+                    output += "  — \(viewEntries.count) view(s): \(viewEntries.map(\.name).joined(separator: ", "))\n"
+                }
+            }
+        }
+
+        if showTested && !result.tested.isEmpty {
+            output += "\nTESTED (\(result.testedCount)):\n"
+
+            let grouped = Dictionary(grouping: result.tested) { $0.moduleName ?? "(no module)" }
+            let sortedModules = grouped.keys.sorted()
+
+            for mod in sortedModules {
+                let entries = grouped[mod]!
+                if sortedModules.count > 1 {
+                    output += "\n  [\(mod)]:\n"
+                }
+                for entry in entries {
+                    output += "  \(entry.kind) \(entry.name)"
+                    if let testedBy = entry.testedBy {
+                        output += " ← \(testedBy)"
+                    }
+                    if let path = entry.filePath, let line = entry.line {
+                        output += " — \(shortenPath(path)):\(line)"
+                    }
+                    output += "\n"
+                }
+            }
+        }
+
+        output += "\nNote: CodingKeys enums auto-filtered. Logic coverage excludes View conformers. Detection via naming (FooTests→Foo) + type references from test files."
+        return CallTool.Result(content: [.text(output)])
+    }
+
+    private func handleCrossModuleUsage(_ args: [String: Value]) throws -> CallTool.Result {
+        guard let module = args["module"]?.stringValue else {
+            return CallTool.Result(content: [.text("Missing required parameter: module")], isError: true)
+        }
+
+        let targetModule = args["target_module"]?.stringValue
+
+        let result = try queryEngine.crossModuleUsage(
+            projectId: projectId,
+            module: module,
+            targetModule: targetModule
+        )
+
+        if result.dependencies.isEmpty {
+            return CallTool.Result(content: [.text("No cross-module type usage found from '\(module)'." + (targetModule != nil ? " Check module names." : ""))])
+        }
+
+        var output = "Cross-module usage from \(module) — \(result.totalCrossModuleTypes) types across \(result.dependencies.count) module(s):\n"
+
+        for dep in result.dependencies {
+            output += "\n→ \(dep.moduleName) (\(dep.types.count) types):\n"
+            for entry in dep.types {
+                output += "  \(entry.kind) \(entry.typeName) (\(entry.usageCount)x)"
+                if let path = entry.filePath, let line = entry.line {
+                    output += " — \(shortenPath(path)):\(line)"
+                }
+                output += "\n"
+            }
+        }
+
+        return CallTool.Result(content: [.text(output)])
+    }
+
+    /// Run a git command and return stdout.
+    private func runGit(_ arguments: [String], at workingDirectory: String) throws -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["-C", workingDirectory] + arguments
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            throw NSError(domain: "SwiftLens", code: Int(process.terminationStatus),
+                          userInfo: [NSLocalizedDescriptionKey: "git \(arguments.joined(separator: " ")) failed with exit code \(process.terminationStatus)"])
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
     // MARK: - Formatting Helpers
 
     private func shortenPath(_ path: String) -> String {
@@ -546,6 +1020,90 @@ struct ToolHandlers: Sendable {
         return output
     }
 
+    private func handleTraceCallGraph(_ args: [String: Value]) throws -> CallTool.Result {
+        guard let function = args["function"]?.stringValue else {
+            return CallTool.Result(content: [.text("Missing required parameter: function")], isError: true)
+        }
+
+        let maxDepth = args["max_depth"]?.intValue ?? 5
+        let directionStr = args["direction"]?.stringValue ?? "both"
+        let direction: DependencyDirection = switch directionStr {
+        case "incoming": .incoming
+        case "outgoing": .outgoing
+        default: .both
+        }
+
+        let result = try queryEngine.traceCallGraph(
+            projectId: projectId,
+            functionName: function,
+            direction: direction,
+            maxDepth: maxDepth
+        )
+
+        if result.kind == "unknown" {
+            return CallTool.Result(content: [.text("Function '\(function)' not found. Try a different name or use search_symbol to find the exact function name.")])
+        }
+
+        let displayName: String
+        if let parent = result.parentType {
+            displayName = parent + "." + result.functionName
+        } else {
+            displayName = result.functionName
+        }
+
+        var output = "Call Graph for \(displayName)"
+        if let path = result.filePath, let line = result.line {
+            output += " — " + shortenPath(path) + ":" + String(line)
+        }
+        output += "\n"
+
+        if direction == .incoming || direction == .both {
+            output += "\n== Callers (who calls \(displayName)) ==\n"
+            if result.callers.isEmpty {
+                output += "  (none found)\n"
+            } else {
+                var lastDepth = 0
+                for node in result.callers {
+                    let indent = String(repeating: "  ", count: node.depth)
+                    if node.depth > lastDepth + 1 {
+                        output += "\n"
+                    }
+                    output += indent + node.kind + " " + node.name
+                    if let path = node.filePath, let line = node.line {
+                        output += " — " + shortenPath(path) + ":" + String(line)
+                    }
+                    output += "\n"
+                    lastDepth = node.depth
+                }
+                output += "  Total: " + String(result.callers.count) + " caller(s)\n"
+            }
+        }
+
+        if direction == .outgoing || direction == .both {
+            output += "\n== Callees (what \(displayName) calls) ==\n"
+            if result.callees.isEmpty {
+                output += "  (none found)\n"
+            } else {
+                var lastDepth = 0
+                for node in result.callees {
+                    let indent = String(repeating: "  ", count: node.depth)
+                    if node.depth > lastDepth + 1 {
+                        output += "\n"
+                    }
+                    output += indent + node.kind + " " + node.name
+                    if let path = node.filePath, let line = node.line {
+                        output += " — " + shortenPath(path) + ":" + String(line)
+                    }
+                    output += "\n"
+                    lastDepth = node.depth
+                }
+                output += "  Total: " + String(result.callees.count) + " callee(s)\n"
+            }
+        }
+
+        return CallTool.Result(content: [.text(output)])
+    }
+
     private func formatImpactTree(_ node: ImpactNode, indent: Int) -> String {
         let prefix = String(repeating: "  ", count: indent)
         var output = prefix
@@ -570,6 +1128,9 @@ struct ToolHandlers: Sendable {
     private func formatViewTree(_ node: ViewTreeNode, indent: Int) -> String {
         let prefix = String(repeating: "  ", count: indent)
         var output = "\(prefix)\(node.name)"
+        if let context = node.context {
+            output += " [\(context)]"
+        }
         if let path = node.filePath, let line = node.line {
             output += " — \(shortenPath(path)):\(line)"
         }

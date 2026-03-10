@@ -9,6 +9,7 @@ public struct FileExtractionResult: Sendable {
     public var environmentDeclarations: [ExtractedEnvironmentDeclaration] = []
     public var environmentInjections: [ExtractedEnvironmentInjection] = []
     public var typeReferences: [ExtractedTypeReference] = []
+    public var functionCalls: [ExtractedFunctionCall] = []
 
     public init(filePath: String) {
         self.filePath = filePath
@@ -91,11 +92,14 @@ public struct ExtractedViewComposition: Sendable {
     public let parentView: String
     public let childView: String
     public let line: Int
+    /// Conditional context, e.g. "conditional", "ForEach", "case .loading"
+    public let context: String?
 
-    public init(parentView: String, childView: String, line: Int) {
+    public init(parentView: String, childView: String, line: Int, context: String? = nil) {
         self.parentView = parentView
         self.childView = childView
         self.line = line
+        self.context = context
     }
 }
 
@@ -137,6 +141,41 @@ public struct ExtractedTypeReference: Sendable {
         self.containingSymbol = containingSymbol
         self.referencedTypeName = referencedTypeName
         self.line = line
+    }
+}
+
+/// The kind of function call detected.
+public enum CallKind: String, Sendable {
+    case selfCall      // self.method() or implicit self
+    case superCall     // super.method()
+    case staticCall    // TypeName.method() or TypeName.shared.method()
+    case instanceCall  // variable.method()
+    case initCall      // TypeName() constructor
+    case freeCall      // top-level free function
+}
+
+/// A function/method call extracted from source.
+public struct ExtractedFunctionCall: Sendable {
+    public let callerName: String        // The calling function name
+    public let callerParent: String?     // Enclosing type of the caller
+    public let calleeName: String        // The called function name
+    public let receiverType: String?     // The type of the receiver (if known)
+    public let kind: CallKind            // How the call was made
+    public let line: Int
+    public let column: Int
+
+    public init(
+        callerName: String, callerParent: String?,
+        calleeName: String, receiverType: String?,
+        kind: CallKind, line: Int, column: Int
+    ) {
+        self.callerName = callerName
+        self.callerParent = callerParent
+        self.calleeName = calleeName
+        self.receiverType = receiverType
+        self.kind = kind
+        self.line = line
+        self.column = column
     }
 }
 

@@ -10,8 +10,11 @@ final class SwiftUIVisitor: SyntaxVisitor {
     /// Stack of current type names.
     private var typeStack: [String] = []
 
-    /// Whether we're inside a `body` computed property.
-    private var insideBody = false
+    /// Whether we're inside a view builder context (body, @ViewBuilder, or View-returning property).
+    private var insideViewBuilder = false
+
+    /// Stack of conditional contexts (if/else, switch/case, ForEach).
+    private var contextStack: [String] = []
 
     /// Known non-view identifiers to skip.
     private static let viewDenyList: Set<String> = [
@@ -24,6 +27,14 @@ final class SwiftUIVisitor: SyntaxVisitor {
         "EdgeInsets", "Alignment", "HorizontalAlignment", "VerticalAlignment",
         "Animation", "Transition",
         "some", "Self", "Never",
+    ]
+
+    /// Suffixes indicating non-View types to reduce false positives.
+    private static let nonViewSuffixes: [String] = [
+        "ViewModel", "Model", "Manager", "Service", "Repository",
+        "Store", "Controller", "Coordinator", "Provider", "Factory",
+        "Handler", "Delegate", "DataSource", "Helper",
+        "Formatter", "Router", "Interactor", "Presenter", "UseCase",
     ]
 
     init(converter: SourceLocationConverter) {
@@ -57,15 +68,18 @@ final class SwiftUIVisitor: SyntaxVisitor {
     }
     override func visitPost(_ node: ExtensionDeclSyntax) { typeStack.removeLast() }
 
-    // MARK: - Body detection
+    // MARK: - View builder context detection
 
     override func visit(_ node: VariableDeclSyntax) -> SyntaxVisitorContinueKind {
         for binding in node.bindings {
-            if let name = binding.pattern.as(IdentifierPatternSyntax.self)?.identifier.text,
-               name == "body",
-               binding.accessorBlock != nil {
-                insideBody = true
-                return .visitChildren
+            guard binding.accessorBlock != nil else { continue }
+            if let name = binding.pattern.as(IdentifierPatternSyntax.self)?.identifier.text {
+                if name == "body"
+                    || isViewReturning(binding: binding)
+                    || hasViewBuilderAttribute(node.attributes) {
+                    insideViewBuilder = true
+                    return .visitChildren
+                }
             }
         }
         return .visitChildren
@@ -73,11 +87,64 @@ final class SwiftUIVisitor: SyntaxVisitor {
 
     override func visitPost(_ node: VariableDeclSyntax) {
         for binding in node.bindings {
-            if let name = binding.pattern.as(IdentifierPatternSyntax.self)?.identifier.text,
-               name == "body" {
-                insideBody = false
+            guard binding.accessorBlock != nil else { continue }
+            if let name = binding.pattern.as(IdentifierPatternSyntax.self)?.identifier.text {
+                if name == "body"
+                    || isViewReturning(binding: binding)
+                    || hasViewBuilderAttribute(node.attributes) {
+                    insideViewBuilder = false
+                }
             }
         }
+    }
+
+    override func visit(_ node: FunctionDeclSyntax) -> SyntaxVisitorContinueKind {
+        if hasViewBuilderAttribute(node.attributes) || isViewReturningFunction(node) {
+            insideViewBuilder = true
+        }
+        return .visitChildren
+    }
+
+    override func visitPost(_ node: FunctionDeclSyntax) {
+        if hasViewBuilderAttribute(node.attributes) || isViewReturningFunction(node) {
+            insideViewBuilder = false
+        }
+    }
+
+    // MARK: - Conditional context tracking
+
+    override func visit(_ node: IfExprSyntax) -> SyntaxVisitorContinueKind {
+        guard insideViewBuilder else { return .visitChildren }
+        let condition = node.conditions.trimmedDescription
+        let label = condition.count > 40
+            ? "if " + condition.prefix(37) + "..."
+            : "if " + condition
+        contextStack.append(label)
+        return .visitChildren
+    }
+
+    override func visitPost(_ node: IfExprSyntax) {
+        guard insideViewBuilder else { return }
+        contextStack.removeLast()
+    }
+
+    override func visit(_ node: SwitchCaseSyntax) -> SyntaxVisitorContinueKind {
+        guard insideViewBuilder else { return .visitChildren }
+        if let caseLabel = node.label.as(SwitchCaseLabelSyntax.self) {
+            let items = caseLabel.caseItems.map { $0.pattern.trimmedDescription }.joined(separator: ", ")
+            let label = items.count > 40
+                ? "case " + items.prefix(35) + "..."
+                : "case " + items
+            contextStack.append(label)
+        } else {
+            contextStack.append("default")
+        }
+        return .visitChildren
+    }
+
+    override func visitPost(_ node: SwitchCaseSyntax) {
+        guard insideViewBuilder else { return }
+        contextStack.removeLast()
     }
 
     // MARK: - View composition & environment injection detection
@@ -104,10 +171,19 @@ final class SwiftUIVisitor: SyntaxVisitor {
             }
         }
 
-        // View composition detection requires being inside a body property.
-        guard insideBody, let parentView = typeStack.last else {
+        // Track ForEach as a conditional context
+        if insideViewBuilder {
+            if let ref = callee.as(DeclReferenceExprSyntax.self), ref.baseName.text == "ForEach" {
+                contextStack.append("ForEach")
+            }
+        }
+
+        // View composition detection requires being inside a view builder context.
+        guard insideViewBuilder, let parentView = typeStack.last else {
             return .visitChildren
         }
+
+        let currentContext = contextStack.isEmpty ? nil : contextStack.joined(separator: " > ")
 
         // Direct view reference: `SomeView(...)`
         if let ref = callee.as(DeclReferenceExprSyntax.self) {
@@ -117,7 +193,8 @@ final class SwiftUIVisitor: SyntaxVisitor {
                 viewCompositions.append(ExtractedViewComposition(
                     parentView: parentView,
                     childView: name,
-                    line: location.line
+                    line: location.line,
+                    context: currentContext
                 ))
             }
         }
@@ -130,12 +207,21 @@ final class SwiftUIVisitor: SyntaxVisitor {
                 viewCompositions.append(ExtractedViewComposition(
                     parentView: parentView,
                     childView: name,
-                    line: location.line
+                    line: location.line,
+                    context: currentContext
                 ))
             }
         }
 
         return .visitChildren
+    }
+
+    override func visitPost(_ node: FunctionCallExprSyntax) {
+        guard insideViewBuilder else { return }
+        if let ref = node.calledExpression.as(DeclReferenceExprSyntax.self),
+           ref.baseName.text == "ForEach" {
+            contextStack.removeLast()
+        }
     }
 
     // MARK: - Navigation destination detection
@@ -161,10 +247,29 @@ final class SwiftUIVisitor: SyntaxVisitor {
 
     // MARK: - Helpers
 
+    private func isViewReturning(binding: PatternBindingSyntax) -> Bool {
+        guard let typeDesc = binding.typeAnnotation?.type.trimmedDescription else { return false }
+        return typeDesc.contains("View")
+    }
+
+    private func isViewReturningFunction(_ node: FunctionDeclSyntax) -> Bool {
+        guard let returnType = node.signature.returnClause?.type.trimmedDescription else { return false }
+        return returnType.contains("View")
+    }
+
+    private func hasViewBuilderAttribute(_ attributes: AttributeListSyntax) -> Bool {
+        attributes.contains { attr in
+            attr.as(AttributeSyntax.self)?.attributeName.trimmedDescription == "ViewBuilder"
+        }
+    }
+
     private func isLikelyView(_ name: String) -> Bool {
         guard let first = name.first, first.isUppercase else { return false }
         guard !Self.viewDenyList.contains(name) else { return false }
         guard name != typeStack.last else { return false }
+        for suffix in Self.nonViewSuffixes {
+            if name.hasSuffix(suffix) { return false }
+        }
         return true
     }
 }

@@ -151,6 +151,25 @@ public struct GraphSchema: Sendable {
             try db.create(indexOn: "type_references", columns: ["projectId", "referencedTypeName"])
         }
 
+        migrator.registerMigration("v4_function_calls") { db in
+            try db.create(table: "function_calls") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.belongsTo("project", inTable: "projects").notNull()
+                t.column("callerSymbolId", .integer)
+                    .notNull()
+                    .references("symbols", onDelete: .cascade)
+                t.column("calleeName", .text).notNull()
+                t.column("receiverType", .text)
+                t.column("callKind", .text).notNull()
+                t.column("filePath", .text)
+                t.column("line", .integer)
+                t.column("column", .integer)
+            }
+            try db.create(indexOn: "function_calls", columns: ["callerSymbolId"])
+            try db.create(indexOn: "function_calls", columns: ["projectId", "calleeName"])
+            try db.create(indexOn: "function_calls", columns: ["projectId", "receiverType", "calleeName"])
+        }
+
         migrator.registerMigration("v1_fts5") { db in
             try db.create(virtualTable: "symbols_fts", using: FTS5()) { t in
                 t.synchronize(withTable: "symbols")

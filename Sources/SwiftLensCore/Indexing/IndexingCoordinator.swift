@@ -15,7 +15,8 @@ public actor IndexingCoordinator {
     public func index(
         projectRoot: String,
         name: String? = nil,
-        config: ProjectConfig = .default
+        config: ProjectConfig = .default,
+        force: Bool = false
     ) async throws -> IndexResult {
         let projectName = name ?? URL(filePath: projectRoot).lastPathComponent
 
@@ -48,20 +49,27 @@ public actor IndexingCoordinator {
         }
 
         // Build module records
-        try await buildModules(projectId: projectId, targets: allTargets)
+        let moduleNameToId = try await buildModules(projectId: projectId, targets: allTargets)
 
         // Build file→module mapping
         let fileModuleMap = buildFileModuleMapping(
             projectRoot: projectRoot,
             targets: allTargets,
-            files: allFiles
+            files: allFiles,
+            moduleIds: moduleNameToId
         )
 
         // Stage 2: Incremental Filter
-        let (changedFiles, deletedFiles) = try await filterChangedFiles(
-            projectId: projectId,
-            files: allFiles
-        )
+        let (changedFiles, deletedFiles): ([String], [String])
+        if force {
+            changedFiles = allFiles
+            deletedFiles = []
+        } else {
+            (changedFiles, deletedFiles) = try await filterChangedFiles(
+                projectId: projectId,
+                files: allFiles
+            )
+        }
 
         // Clean up deleted files
         if !deletedFiles.isEmpty {
@@ -102,12 +110,31 @@ public actor IndexingCoordinator {
 
         try await resolveTypeReferences(projectId: projectId)
 
+        try await resolveFunctionCalls(projectId: projectId)
+
+        // Gather post-index stats
+        let (totalSymbols, totalEdges) = try await db.dbWriter.read { db in
+            let symbols = try Int.fetchOne(
+                db,
+                sql: "SELECT COUNT(*) FROM symbols WHERE projectId = ? AND qualifiedName NOT LIKE 'unresolved:%'",
+                arguments: [projectId]
+            ) ?? 0
+            let edges = try Int.fetchOne(
+                db,
+                sql: "SELECT COUNT(*) FROM edges WHERE projectId = ?",
+                arguments: [projectId]
+            ) ?? 0
+            return (symbols, edges)
+        }
+
         return IndexResult(
             projectId: projectId,
             totalFiles: allFiles.count,
             indexedFiles: changedFiles.count,
             deletedFiles: deletedFiles.count,
-            modules: allTargets.count
+            modules: allTargets.count,
+            totalSymbols: totalSymbols,
+            totalEdges: totalEdges
         )
     }
 
@@ -174,29 +201,40 @@ public actor IndexingCoordinator {
         fileModuleMap: [String: Int64]
     ) async throws {
         try await db.dbWriter.write { [results] db in
+            // Pass 1: Delete old data for ALL changed files first.
+            // This prevents cascade issues where processing file B deletes
+            // cross-file edges that were just created by file A.
             for result in results {
-                let moduleId = fileModuleMap[result.filePath]
-
-                // First pass: insert all declarations as symbols
-                var symbolIds: [String: Int64] = [:] // qualifiedName → id
-
-                // Remove old symbols from this file
                 try db.execute(
                     sql: "DELETE FROM symbols WHERE projectId = ? AND filePath = ?",
                     arguments: [projectId, result.filePath]
                 )
-
-                // Remove old wrapper usages from this file
                 try db.execute(
                     sql: "DELETE FROM wrapper_usage WHERE projectId = ? AND filePath = ?",
                     arguments: [projectId, result.filePath]
                 )
-
-                // Remove old environment keys from this file
                 try db.execute(
                     sql: "DELETE FROM environment_keys WHERE projectId = ? AND filePath = ?",
                     arguments: [projectId, result.filePath]
                 )
+                try db.execute(
+                    sql: "DELETE FROM environment_injections WHERE projectId = ? AND filePath = ?",
+                    arguments: [projectId, result.filePath]
+                )
+                try db.execute(
+                    sql: "DELETE FROM type_references WHERE projectId = ? AND filePath = ?",
+                    arguments: [projectId, result.filePath]
+                )
+                try db.execute(
+                    sql: "DELETE FROM function_calls WHERE projectId = ? AND filePath = ?",
+                    arguments: [projectId, result.filePath]
+                )
+            }
+
+            // Pass 2: Insert new symbols and edges for all files.
+            for result in results {
+                let moduleId = fileModuleMap[result.filePath]
+                var symbolIds: [String: Int64] = [:] // qualifiedName → id
 
                 for decl in result.declarations {
                     let qualifiedName = Self.buildQualifiedName(
@@ -369,12 +407,6 @@ public actor IndexingCoordinator {
                     )
                 }
 
-                // Remove old environment injections from this file
-                try db.execute(
-                    sql: "DELETE FROM environment_injections WHERE projectId = ? AND filePath = ?",
-                    arguments: [projectId, result.filePath]
-                )
-
                 // Process environment injections (.environment() modifier calls)
                 for injection in result.environmentInjections {
                     let viewQN = result.declarations
@@ -393,12 +425,6 @@ public actor IndexingCoordinator {
                         try record.insert(db)
                     }
                 }
-
-                // Remove old type references from this file
-                try db.execute(
-                    sql: "DELETE FROM type_references WHERE projectId = ? AND filePath = ?",
-                    arguments: [projectId, result.filePath]
-                )
 
                 // Process type references
                 for ref in result.typeReferences {
@@ -422,6 +448,32 @@ public actor IndexingCoordinator {
                             )
                             try record.insert(db)
                         }
+                    }
+                }
+
+                // Process function calls
+                for call in result.functionCalls {
+                    // Find the caller symbol — build qualified name from parent + name
+                    let callerQN: String?
+                    if let parent = call.callerParent {
+                        callerQN = parent + "." + call.callerName
+                    } else {
+                        let fileName = URL(filePath: result.filePath).lastPathComponent
+                        callerQN = fileName + ":" + call.callerName
+                    }
+
+                    if let callerQN, let callerId = symbolIds[callerQN] {
+                        var record = FunctionCallRecord(
+                            projectId: projectId,
+                            callerSymbolId: callerId,
+                            calleeName: call.calleeName,
+                            receiverType: call.receiverType,
+                            callKind: call.kind.rawValue,
+                            filePath: result.filePath,
+                            line: call.line,
+                            column: call.column
+                        )
+                        try record.insert(db)
                     }
                 }
 
@@ -477,7 +529,8 @@ public actor IndexingCoordinator {
                             projectId: projectId,
                             sourceId: parentId,
                             targetId: childId,
-                            kind: EdgeKind.composesView.rawValue
+                            kind: EdgeKind.composesView.rawValue,
+                            metadata: comp.context
                         )
                         try? edge.insert(db) // Ignore duplicate edge errors
                     }
@@ -488,7 +541,8 @@ public actor IndexingCoordinator {
 
     // MARK: - Module Building
 
-    private func buildModules(projectId: Int64, targets: [SPMTarget]) async throws {
+    @discardableResult
+    private func buildModules(projectId: Int64, targets: [SPMTarget]) async throws -> [String: Int64] {
         try await db.dbWriter.write { db in
             // Clear existing modules for this project
             try db.execute(
@@ -500,10 +554,12 @@ public actor IndexingCoordinator {
 
             // Insert all targets
             for target in targets {
+                let resolvedPath = target.path
+                    ?? (target.kind == .test ? "Tests/" + target.name : "Sources/" + target.name)
                 var module = ModuleRecord(
                     projectId: projectId,
                     name: target.name,
-                    path: target.path,
+                    path: resolvedPath,
                     kind: target.kind.rawValue
                 )
                 try module.insert(db)
@@ -522,6 +578,8 @@ public actor IndexingCoordinator {
                     try depRecord.insert(db)
                 }
             }
+
+            return moduleIds
         }
     }
 
@@ -530,12 +588,39 @@ public actor IndexingCoordinator {
     private func buildFileModuleMapping(
         projectRoot: String,
         targets: [SPMTarget],
-        files: [String]
+        files: [String],
+        moduleIds: [String: Int64]
     ) -> [String: Int64] {
-        // For now, return empty mapping. This will be populated after modules are in the DB.
-        // The mapping is: file path → module ID based on directory containment.
-        // This is handled lazily during assembly.
-        [:]
+        // Build absolute directory paths for each target
+        var targetDirs: [(absoluteDir: String, moduleId: Int64)] = []
+        for target in targets {
+            guard let moduleId = moduleIds[target.name] else { continue }
+            let relPath = target.path ?? Self.defaultTargetPath(for: target)
+            let absDir = projectRoot + "/" + relPath + "/"
+            targetDirs.append((absDir, moduleId))
+        }
+
+        // Sort by path length descending so more specific paths match first
+        targetDirs.sort { $0.absoluteDir.count > $1.absoluteDir.count }
+
+        var mapping: [String: Int64] = [:]
+        for file in files {
+            for (dir, moduleId) in targetDirs {
+                if file.hasPrefix(dir) {
+                    mapping[file] = moduleId
+                    break
+                }
+            }
+        }
+        return mapping
+    }
+
+    /// Default SPM target directory when no explicit path is specified.
+    private static func defaultTargetPath(for target: SPMTarget) -> String {
+        switch target.kind {
+        case .test: return "Tests/" + target.name
+        default: return "Sources/" + target.name
+        }
     }
 
     // MARK: - Hash Management
@@ -748,6 +833,88 @@ public actor IndexingCoordinator {
         }
     }
 
+    // MARK: - Resolve Function Calls
+
+    /// Create calls edges from function_calls table.
+    /// Matches callee name + receiver type to symbols in the graph.
+    /// For extensions, redirects the source to the base type.
+    private func resolveFunctionCalls(projectId: Int64) async throws {
+        try await db.dbWriter.write { db in
+            // Delete all existing calls edges for this project
+            try db.execute(
+                sql: "DELETE FROM edges WHERE projectId = ? AND kind = ?",
+                arguments: [projectId, EdgeKind.calls.rawValue]
+            )
+
+            // Strategy 1: Resolve calls with known receiver type
+            // Match receiverType.calleeName to ParentType.methodName in symbols
+            try db.execute(sql: """
+                INSERT OR IGNORE INTO edges (projectId, sourceId, targetId, kind, metadata)
+                SELECT DISTINCT fc.projectId,
+                    fc.callerSymbolId,
+                    target.id,
+                    'calls',
+                    fc.callKind
+                FROM function_calls fc
+                JOIN symbols parent ON parent.projectId = fc.projectId
+                    AND parent.name = fc.receiverType
+                    AND parent.kind IN ('struct', 'class', 'enum', 'actor', 'protocol')
+                    AND parent.qualifiedName NOT LIKE 'unresolved:%'
+                JOIN edges ce ON ce.sourceId = parent.id AND ce.kind = 'contains'
+                JOIN symbols target ON ce.targetId = target.id
+                    AND target.name = fc.calleeName
+                    AND target.kind IN ('function', 'variable', 'initializer')
+                WHERE fc.projectId = ?
+                    AND fc.receiverType IS NOT NULL
+                    AND fc.callerSymbolId != target.id
+                """, arguments: [projectId])
+
+            // Strategy 2: Resolve init calls — TypeName() → TypeName.init
+            try db.execute(sql: """
+                INSERT OR IGNORE INTO edges (projectId, sourceId, targetId, kind, metadata)
+                SELECT DISTINCT fc.projectId,
+                    fc.callerSymbolId,
+                    target.id,
+                    'calls',
+                    'initCall'
+                FROM function_calls fc
+                JOIN symbols parent ON parent.projectId = fc.projectId
+                    AND parent.name = fc.receiverType
+                    AND parent.kind IN ('struct', 'class', 'enum', 'actor')
+                    AND parent.qualifiedName NOT LIKE 'unresolved:%'
+                JOIN edges ce ON ce.sourceId = parent.id AND ce.kind = 'contains'
+                JOIN symbols target ON ce.targetId = target.id
+                    AND target.kind = 'initializer'
+                WHERE fc.projectId = ?
+                    AND fc.callKind = 'initCall'
+                    AND fc.callerSymbolId != target.id
+                """, arguments: [projectId])
+
+            // Strategy 3: Free function calls (no receiver type, callKind = freeCall)
+            // Match by name against top-level functions
+            try db.execute(sql: """
+                INSERT OR IGNORE INTO edges (projectId, sourceId, targetId, kind, metadata)
+                SELECT DISTINCT fc.projectId,
+                    fc.callerSymbolId,
+                    target.id,
+                    'calls',
+                    'freeCall'
+                FROM function_calls fc
+                JOIN symbols target ON target.projectId = fc.projectId
+                    AND target.name = fc.calleeName
+                    AND target.kind = 'function'
+                    AND target.qualifiedName NOT LIKE 'unresolved:%'
+                    -- Only match top-level functions (not members)
+                    AND NOT EXISTS (
+                        SELECT 1 FROM edges me WHERE me.targetId = target.id AND me.kind = 'contains'
+                    )
+                WHERE fc.projectId = ?
+                    AND fc.callKind = 'freeCall'
+                    AND fc.callerSymbolId != target.id
+                """, arguments: [projectId])
+        }
+    }
+
     // MARK: - Helpers
 
     static func buildQualifiedName(decl: ExtractedDeclaration, filePath: String) -> String {
@@ -786,6 +953,8 @@ public struct IndexResult: Sendable {
     public let indexedFiles: Int
     public let deletedFiles: Int
     public let modules: Int
+    public let totalSymbols: Int
+    public let totalEdges: Int
 }
 
 // MARK: - Project Config

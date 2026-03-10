@@ -10,5 +10,6 @@ public enum EdgeKind: String, Codable, Sendable, CaseIterable {
     case declaresEnvironment // type → EnvironmentKey declaration
     case dependsOn         // module → module
     case references        // symbol → referenced symbol
+    case calls             // function → called function
     case appliesWrapper    // property → wrapper type
 }

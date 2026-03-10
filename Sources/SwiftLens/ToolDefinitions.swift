@@ -6,6 +6,8 @@ enum ToolDefinitions {
     static let allTools: [Tool] = [
         searchSymbol,
         getSymbol,
+        symbolsInFile,
+        findUsages,
         findConformers,
         getModuleGraph,
         traceViewTree,
@@ -18,17 +20,25 @@ enum ToolDefinitions {
         impactAnalysis,
         checkEnvironmentInjection,
         auditAccessControl,
+        diffSince,
+        testCoverage,
+        crossModuleUsage,
+        traceCallGraph,
     ]
 
     static let searchSymbol = Tool(
         name: "search_symbol",
-        description: "Search for Swift symbols (types, functions, properties) by name. Uses FTS5 for fast prefix/fuzzy matching.",
+        description: "Search for Swift symbols by name, attribute, or both. Uses FTS5 for fast prefix/fuzzy matching on names. Attribute search finds types with specific decorators (e.g. @MainActor, @Observable) and properties with specific wrappers (e.g. @Environment, @State). At least one of query or attribute must be provided.",
         inputSchema: .object([
             "type": .string("object"),
             "properties": .object([
                 "query": .object([
                     "type": .string("string"),
-                    "description": .string("Search query (supports prefix matching)"),
+                    "description": .string("Search query for symbol name (supports prefix matching). Optional if attribute is provided."),
+                ]),
+                "attribute": .object([
+                    "type": .string("string"),
+                    "description": .string("Filter by attribute or property wrapper (e.g. \"@MainActor\", \"Observable\", \"Environment\", \"State\"). Searches both type-level attributes and property wrapper usage."),
                 ]),
                 "kind": .object([
                     "type": .string("string"),
@@ -48,7 +58,6 @@ enum ToolDefinitions {
                     "description": .string("Max results (default 20)"),
                 ]),
             ]),
-            "required": .array([.string("query")]),
         ]),
         annotations: .init(readOnlyHint: true)
     )
@@ -65,6 +74,47 @@ enum ToolDefinitions {
                 ]),
             ]),
             "required": .array([.string("name")]),
+        ]),
+        annotations: .init(readOnlyHint: true)
+    )
+
+    static let symbolsInFile = Tool(
+        name: "symbols_in_file",
+        description: "List all symbols defined in a specific file, ordered by line number. Useful for understanding file contents without reading source.",
+        inputSchema: .object([
+            "type": .string("object"),
+            "properties": .object([
+                "file_path": .object([
+                    "type": .string("string"),
+                    "description": .string("Absolute or project-relative file path"),
+                ]),
+                "kind": .object([
+                    "type": .string("string"),
+                    "description": .string("Filter by symbol kind"),
+                    "enum": .array([
+                        .string("struct"), .string("class"), .string("enum"),
+                        .string("protocol"), .string("actor"), .string("function"),
+                        .string("variable"), .string("extension"), .string("typeAlias"),
+                    ]),
+                ]),
+            ]),
+            "required": .array([.string("file_path")]),
+        ]),
+        annotations: .init(readOnlyHint: true)
+    )
+
+    static let findUsages = Tool(
+        name: "find_usages",
+        description: "Find all usage sites of a symbol with file:line locations. For types, shows exact reference locations from type annotations, initializer calls, and static member access. For members (functions/properties), shows references to the parent type as an approximation.",
+        inputSchema: .object([
+            "type": .string("object"),
+            "properties": .object([
+                "symbol": .object([
+                    "type": .string("string"),
+                    "description": .string("Symbol name to find usages of"),
+                ]),
+            ]),
+            "required": .array([.string("symbol")]),
         ]),
         annotations: .init(readOnlyHint: true)
     )
@@ -164,23 +214,32 @@ enum ToolDefinitions {
 
     static let reindex = Tool(
         name: "reindex",
-        description: "Trigger an incremental re-index of the project. Only re-parses files that have changed since last index.",
+        description: "Trigger a re-index of the project. By default only re-parses files changed since last index. Use force=true to re-parse all files (useful after tool upgrades that change extraction logic).",
         inputSchema: .object([
             "type": .string("object"),
-            "properties": .object([:]),
+            "properties": .object([
+                "force": .object([
+                    "type": .string("boolean"),
+                    "description": .string("Force full re-parse of all files, ignoring file hashes (default false)"),
+                ]),
+            ]),
         ]),
         annotations: .init(readOnlyHint: false, idempotentHint: true)
     )
 
     static let findDeadCode = Tool(
         name: "find_dead_code",
-        description: "Find potentially dead code — top-level symbols with zero incoming usage edges. Filters out entry points, test targets, protocol requirements, and wrapper properties.",
+        description: "Find potentially dead code — symbols with zero or few incoming usage edges. With max_references=0 (default), finds completely dead code. With max_references=1+, also surfaces near-dead symbols that may only be referenced by a test.",
         inputSchema: .object([
             "type": .string("object"),
             "properties": .object([
                 "module": .object([
                     "type": .string("string"),
                     "description": .string("Filter to a specific SPM module"),
+                ]),
+                "max_references": .object([
+                    "type": .string("integer"),
+                    "description": .string("Maximum incoming references to include (default 0 = truly dead only, 1 = also near-dead with single reference)"),
                 ]),
             ]),
         ]),
@@ -262,6 +321,90 @@ enum ToolDefinitions {
                     ]),
                 ]),
             ]),
+        ]),
+        annotations: .init(readOnlyHint: true)
+    )
+
+    static let diffSince = Tool(
+        name: "diff_since",
+        description: "Show symbols added, removed, or changed since a git ref (branch, tag, or commit SHA). Compares the old source at that ref with the current index to produce a structured diff of symbol-level changes — useful for PR review and understanding what changed.",
+        inputSchema: .object([
+            "type": .string("object"),
+            "properties": .object([
+                "commit": .object([
+                    "type": .string("string"),
+                    "description": .string("Git ref to compare against (branch name, tag, or commit SHA, e.g. 'main', 'v1.0', 'abc1234')"),
+                ]),
+                "limit": .object([
+                    "type": .string("integer"),
+                    "description": .string("Max symbols per section — added/removed/modified (default 100). Use 0 for unlimited."),
+                ]),
+            ]),
+            "required": .array([.string("commit")]),
+        ]),
+        annotations: .init(readOnlyHint: true)
+    )
+
+    static let testCoverage = Tool(
+        name: "test_coverage",
+        description: "Find which types have tests and which don't. Cross-references test targets with production code using naming conventions (FooTests → Foo) and type reference analysis from test files. Shows coverage percentage and lists untested types.",
+        inputSchema: .object([
+            "type": .string("object"),
+            "properties": .object([
+                "module": .object([
+                    "type": .string("string"),
+                    "description": .string("Filter to a specific production module"),
+                ]),
+                "show_tested": .object([
+                    "type": .string("boolean"),
+                    "description": .string("Also show tested types with their test counterparts (default false — only untested)"),
+                ]),
+            ]),
+        ]),
+        annotations: .init(readOnlyHint: true)
+    )
+
+    static let crossModuleUsage = Tool(
+        name: "cross_module_usage",
+        description: "Show which specific types a module imports from other modules. Reveals the actual API surface used across module boundaries — not just the module dependency edge, but which protocols, types, and enums cross the boundary. Useful for validating module boundaries and catching over-broad imports.",
+        inputSchema: .object([
+            "type": .string("object"),
+            "properties": .object([
+                "module": .object([
+                    "type": .string("string"),
+                    "description": .string("Source module to analyze (e.g. 'RyvusFeatures')"),
+                ]),
+                "target_module": .object([
+                    "type": .string("string"),
+                    "description": .string("Filter to a specific target module (optional)"),
+                ]),
+            ]),
+            "required": .array([.string("module")]),
+        ]),
+        annotations: .init(readOnlyHint: true)
+    )
+
+    static let traceCallGraph = Tool(
+        name: "trace_call_graph",
+        description: "Trace the call graph of a function — who calls it (callers) and what it calls (callees), with transitive chain analysis. Supports self.method(), Type.staticMethod(), Type.shared.method(), typed local variables, free functions, and initializer calls.",
+        inputSchema: .object([
+            "type": .string("object"),
+            "properties": .object([
+                "function": .object([
+                    "type": .string("string"),
+                    "description": .string("Function name (e.g. 'fetchMovie') or qualified name (e.g. 'MovieService.fetchMovie')"),
+                ]),
+                "direction": .object([
+                    "type": .string("string"),
+                    "description": .string("Direction: incoming (callers), outgoing (callees), or both (default)"),
+                    "enum": .array([.string("incoming"), .string("outgoing"), .string("both")]),
+                ]),
+                "max_depth": .object([
+                    "type": .string("integer"),
+                    "description": .string("Maximum traversal depth for transitive calls (default 5)"),
+                ]),
+            ]),
+            "required": .array([.string("function")]),
         ]),
         annotations: .init(readOnlyHint: true)
     )

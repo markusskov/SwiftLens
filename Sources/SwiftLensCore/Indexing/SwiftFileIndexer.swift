@@ -23,12 +23,14 @@ public struct SwiftFileIndexer: Sendable {
         let wrapperVisitor = PropertyWrapperVisitor(converter: converter)
         let swiftUIVisitor = SwiftUIVisitor(converter: converter)
         let typeRefVisitor = TypeReferenceVisitor(converter: converter)
+        let callGraphVisitor = CallGraphVisitor(converter: converter)
 
         declVisitor.walk(sourceFile)
         importVisitor.walk(sourceFile)
         wrapperVisitor.walk(sourceFile)
         swiftUIVisitor.walk(sourceFile)
         typeRefVisitor.walk(sourceFile)
+        callGraphVisitor.walk(sourceFile)
 
         var result = FileExtractionResult(filePath: filePath)
         result.declarations = declVisitor.declarations
@@ -39,6 +41,7 @@ public struct SwiftFileIndexer: Sendable {
         result.environmentDeclarations = wrapperVisitor.environmentDeclarations
         result.environmentInjections = swiftUIVisitor.environmentInjections
         result.typeReferences = typeRefVisitor.typeReferences
+        result.functionCalls = callGraphVisitor.functionCalls
 
         return result
     }

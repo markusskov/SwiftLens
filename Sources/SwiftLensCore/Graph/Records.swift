@@ -25,7 +25,7 @@ public struct ModuleRecord: Codable, FetchableRecord, MutablePersistableRecord, 
     public var projectId: Int64
     public var name: String
     public var path: String?
-    public var kind: String // "target", "testTarget", "executableTarget", "external"
+    public var kind: String // SPMTargetKind.rawValue: "regular", "test", "executable", etc.
 
     public mutating func didInsert(_ inserted: InsertionSuccess) {
         id = inserted.rowID
@@ -153,6 +153,26 @@ public struct TypeReferenceRecord: Codable, FetchableRecord, MutablePersistableR
     public var referencedTypeName: String
     public var filePath: String?
     public var line: Int?
+
+    public mutating func didInsert(_ inserted: InsertionSuccess) {
+        id = inserted.rowID
+    }
+}
+
+// MARK: - Function Call Record
+
+public struct FunctionCallRecord: Codable, FetchableRecord, MutablePersistableRecord, Sendable {
+    public static let databaseTableName = "function_calls"
+
+    public var id: Int64?
+    public var projectId: Int64
+    public var callerSymbolId: Int64      // The calling function/method symbol
+    public var calleeName: String         // The called function name
+    public var receiverType: String?      // The receiver type (if known)
+    public var callKind: String           // CallKind raw value
+    public var filePath: String?
+    public var line: Int?
+    public var column: Int?
 
     public mutating func didInsert(_ inserted: InsertionSuccess) {
         id = inserted.rowID
