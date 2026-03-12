@@ -214,13 +214,17 @@ enum ToolDefinitions {
 
     static let reindex = Tool(
         name: "reindex",
-        description: "Trigger a re-index of the project. By default only re-parses files changed since last index. Use force=true to re-parse all files (useful after tool upgrades that change extraction logic).",
+        description: "Trigger a re-index of the project. By default only re-parses files changed since last index. Use force=true to re-parse all files. If an index store is available (from `swift build`), enriches the graph with compiler-resolved USRs, call edges, and override/requirement relationships.",
         inputSchema: .object([
             "type": .string("object"),
             "properties": .object([
                 "force": .object([
                     "type": .string("boolean"),
                     "description": .string("Force full re-parse of all files, ignoring file hashes (default false)"),
+                ]),
+                "index_store_path": .object([
+                    "type": .string("string"),
+                    "description": .string("Path to the index store directory (auto-detected from .build/ if not provided)"),
                 ]),
             ]),
         ]),

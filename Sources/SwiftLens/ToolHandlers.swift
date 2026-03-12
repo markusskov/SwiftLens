@@ -388,20 +388,32 @@ struct ToolHandlers: Sendable {
 
     private func handleReindex(_ args: [String: Value]) async throws -> CallTool.Result {
         let force = args["force"]?.boolValue ?? false
+        let indexStorePath = args["index_store_path"]?.stringValue
         let result = try await indexingCoordinator.index(
             projectRoot: projectRoot,
             config: projectConfig,
-            force: force
+            force: force,
+            indexStorePath: indexStorePath
         )
 
         let mode = force ? "Full reindex" : "Reindex"
-        let output = """
+        var output = """
             \(mode) complete:
               Files: \(result.totalFiles) total, \(result.indexedFiles) re-parsed, \(result.deletedFiles) deleted
               Modules: \(result.modules)
               Symbols: \(result.totalSymbols)
               Edges: \(result.totalEdges)
             """
+
+        if let enrichment = result.enrichment {
+            output += "\n  Index Store Enrichment:"
+            output += "\n    USRs populated: \(enrichment.usrsPopulated)"
+            output += "\n    Call edges (compiler-resolved): \(enrichment.callEdgesCreated)"
+            output += "\n    Override edges: \(enrichment.overrideEdgesCreated)"
+            output += "\n    Requirement edges: \(enrichment.requirementEdgesCreated)"
+            output += "\n    Receiver types backfilled: \(enrichment.receiverTypesBackfilled)"
+        }
+
         return CallTool.Result(content: [.text(output)])
     }
 

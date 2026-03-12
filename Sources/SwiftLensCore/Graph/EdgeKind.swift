@@ -12,4 +12,6 @@ public enum EdgeKind: String, Codable, Sendable, CaseIterable {
     case references        // symbol → referenced symbol
     case calls             // function → called function
     case appliesWrapper    // property → wrapper type
+    case overrides         // method → overridden superclass method
+    case implementsRequirement // concrete method → protocol requirement
 }

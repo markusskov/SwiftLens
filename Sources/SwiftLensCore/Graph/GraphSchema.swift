@@ -179,6 +179,10 @@ public struct GraphSchema: Sendable {
             }
         }
 
+        migrator.registerMigration("v5_index_store") { db in
+            try db.create(indexOn: "symbols", columns: ["usr"])
+        }
+
         return migrator
     }
 }

@@ -16,7 +16,8 @@ public actor IndexingCoordinator {
         projectRoot: String,
         name: String? = nil,
         config: ProjectConfig = .default,
-        force: Bool = false
+        force: Bool = false,
+        indexStorePath: String? = nil
     ) async throws -> IndexResult {
         let projectName = name ?? URL(filePath: projectRoot).lastPathComponent
 
@@ -112,6 +113,21 @@ public actor IndexingCoordinator {
 
         try await resolveFunctionCalls(projectId: projectId)
 
+        // Index store enrichment (optional — skipped if no index store found)
+        let enrichResult: IndexStoreEnricher.EnrichmentResult?
+        let resolvedStorePath = indexStorePath
+            ?? IndexStorePathResolver.findIndexStorePath(projectRoot: projectRoot)
+        if let storePath = resolvedStorePath {
+            let enricher = IndexStoreEnricher(db: db)
+            enrichResult = try await enricher.enrich(
+                projectId: projectId,
+                indexStorePath: storePath,
+                projectRoot: projectRoot
+            )
+        } else {
+            enrichResult = nil
+        }
+
         // Gather post-index stats
         let (totalSymbols, totalEdges) = try await db.dbWriter.read { db in
             let symbols = try Int.fetchOne(
@@ -134,7 +150,8 @@ public actor IndexingCoordinator {
             deletedFiles: deletedFiles.count,
             modules: allTargets.count,
             totalSymbols: totalSymbols,
-            totalEdges: totalEdges
+            totalEdges: totalEdges,
+            enrichment: enrichResult
         )
     }
 
@@ -955,6 +972,7 @@ public struct IndexResult: Sendable {
     public let modules: Int
     public let totalSymbols: Int
     public let totalEdges: Int
+    public let enrichment: IndexStoreEnricher.EnrichmentResult?
 }
 
 // MARK: - Project Config

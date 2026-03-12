@@ -13,6 +13,7 @@ let package = Package(
         .package(url: "https://github.com/swiftlang/swift-syntax.git", from: "602.0.0"),
         .package(url: "https://github.com/groue/GRDB.swift.git", from: "7.4.1"),
         .package(url: "https://github.com/modelcontextprotocol/swift-sdk.git", from: "0.11.0"),
+        .package(url: "https://github.com/swiftlang/indexstore-db.git", branch: "main"),
     ],
     targets: [
         .target(
@@ -21,6 +22,7 @@ let package = Package(
                 .product(name: "SwiftParser", package: "swift-syntax"),
                 .product(name: "SwiftSyntax", package: "swift-syntax"),
                 .product(name: "GRDB", package: "GRDB.swift"),
+                .product(name: "IndexStore", package: "indexstore-db"),
             ]
         ),
         .executableTarget(

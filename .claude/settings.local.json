@@ -1,0 +1,38 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(tmux send-keys:*)",
+      "Bash(swift build:*)",
+      "Bash(sqlite3 ~/.cache/swift-lens/a49c672696c85c1e.db \"SELECT name, kind, signature FROM symbols WHERE signature IS NOT NULL AND kind IN \\('function', 'initializer'\\) LIMIT 10;\")",
+      "Bash(cat /Users/markusskov/Documents/SwiftLens/Package.resolved | python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); [print\\(f'{p[\\\\\"identity\\\\\"]}: {p[\\\\\"state\\\\\"][\\\\\"version\\\\\"]}'\\) for p in d['pins']]\")",
+      "Bash(swift test:*)",
+      "Bash(rm ~/.cache/swift-lens/a49c672696c85c1e.db ~/.cache/swift-lens/a49c672696c85c1e.db-shm ~/.cache/swift-lens/a49c672696c85c1e.db-wal 2>/dev/null; swift run swift-lens --project /Users/markusskov/Documents/Ryvus 2>&1 | head -20)",
+      "Bash(sqlite3 ~/.cache/swift-lens/a49c672696c85c1e.db \"SELECT name, kind, signature FROM symbols WHERE kind IN \\('function', 'initializer'\\) AND signature IS NOT NULL LIMIT 10;\")",
+      "Bash(echo \"=== Bug 5: Unresolved entries ===\" && sqlite3 ~/.cache/swift-lens/a49c672696c85c1e.db \"SELECT count\\(*\\) FROM symbols WHERE qualifiedName LIKE 'unresolved:%';\" && echo \"=== Bug 3: ViewModel query \\(should show only class/struct\\) ===\" && sqlite3 ~/.cache/swift-lens/a49c672696c85c1e.db \"SELECT name, kind FROM symbols WHERE \\(name LIKE '%ViewModel' OR attributes LIKE '%@Observable%'\\) AND kind IN \\('class', 'struct'\\) ORDER BY name;\")",
+      "Bash(sqlite3 ~/.cache/swift-lens/a49c672696c85c1e.db \"SELECT name FROM symbols WHERE qualifiedName LIKE 'unresolved:%' ORDER BY name LIMIT 15;\")",
+      "Bash(kill 64983 && sleep 1 && swift build -q 2>&1 && cp .build/debug/swift-lens ~/.local/bin/swift-lens 2>/dev/null; echo \"Binary updated\")",
+      "Read(//Users/markusskov/.claude/**)",
+      "Read(//Users/markusskov/Documents/Ryvus/**)",
+      "Read(//Users/markusskov/Documents/Ryvus/.claude/**)",
+      "Bash(sqlite3 ~/.cache/swift-lens/a49c672696c85c1e.db \"\nSELECT s.name, s.kind\nFROM symbols s\nLEFT JOIN modules m ON s.moduleId = m.id\nWHERE s.projectId = 1\n  AND s.kind IN \\('struct', 'class', 'enum', 'actor', 'function', 'typeAlias'\\)\n  AND s.qualifiedName NOT LIKE 'unresolved:%'\n  AND s.qualifiedName NOT LIKE 'file:%'\n  AND s.qualifiedName NOT LIKE 'module:%'\n  AND NOT EXISTS \\(SELECT 1 FROM edges ce WHERE ce.targetId = s.id AND ce.kind = 'contains'\\)\n  AND NOT EXISTS \\(SELECT 1 FROM edges ue WHERE ue.targetId = s.id AND ue.kind NOT IN \\('extends', 'contains'\\)\\)\n  AND \\(s.attributes IS NULL OR s.attributes NOT LIKE '%@main%'\\)\n  AND NOT EXISTS \\(SELECT 1 FROM modules tm WHERE tm.id = s.moduleId AND tm.kind = 'testTarget'\\)\n  AND \\(s.filePath IS NULL OR \\(s.filePath NOT LIKE '%/Tests/%' AND s.filePath NOT LIKE '%Tests.swift'\\)\\)\n  AND NOT EXISTS \\(SELECT 1 FROM edges ce WHERE ce.sourceId = s.id AND ce.kind = 'conformsTo'\\)\nORDER BY s.kind, s.name;\n\")",
+      "Bash(sqlite3 ~/.cache/swift-lens/a49c672696c85c1e.db \"\n-- Check if MovieDetailView has incoming composesView edges\nSELECT e.kind, s.name FROM edges e JOIN symbols s ON e.sourceId = s.id\nWHERE e.targetId = \\(SELECT id FROM symbols WHERE name = 'MovieDetailView' AND kind = 'struct' AND qualifiedName NOT LIKE 'unresolved:%' LIMIT 1\\)\nAND e.kind NOT IN \\('extends', 'contains'\\);\n\n-- Check why structs like Category, Episode, etc. show as dead\nSELECT e.kind, count\\(*\\) FROM edges e\nWHERE e.targetId = \\(SELECT id FROM symbols WHERE name = 'Category' AND kind = 'struct' AND qualifiedName NOT LIKE 'unresolved:%' LIMIT 1\\)\nGROUP BY e.kind;\n\")",
+      "Bash(sqlite3 ~/.cache/swift-lens/a49c672696c85c1e.db \"\n-- Does MovieDetailView have ANY incoming edges?\nSELECT e.kind, s.name as fromSymbol FROM edges e JOIN symbols s ON e.sourceId = s.id\nWHERE e.targetId IN \\(SELECT id FROM symbols WHERE name = 'MovieDetailView' AND kind = 'struct' AND qualifiedName NOT LIKE 'unresolved:%'\\);\n\")",
+      "Bash(ls ~/.cache/swift-lens/*.db 2>/dev/null)",
+      "Bash(sqlite3 ~/.cache/swift-lens/a49c672696c85c1e.db \"SELECT kind, COUNT\\(*\\) FROM symbols WHERE qualifiedName NOT LIKE 'unresolved:%' GROUP BY kind ORDER BY COUNT\\(*\\) DESC\")",
+      "Bash(sqlite3 ~/.cache/swift-lens/a49c672696c85c1e.db \"SELECT id, name, qualifiedName, kind, filePath FROM symbols WHERE name LIKE '%createDefault%'\")",
+      "Bash(echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"1.0\"}}}' | timeout 5 .build/debug/swift-lens --project . 2>/dev/null | head -5)",
+      "Bash(echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"1.0\"}}}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}' | timeout 8 .build/debug/swift-lens --project . 2>/dev/null | python3 -c \"\nimport sys, json\nfor line in sys.stdin:\n    line = line.strip\\(\\)\n    if not line: continue\n    try:\n        d = json.loads\\(line\\)\n        if 'result' in d and 'tools' in d['result']:\n            tools = [t['name'] for t in d['result']['tools']]\n            print\\(f'Tools \\({len\\(tools\\)}\\):'\\)\n            for t in tools:\n                print\\(f'  {t}'\\)\n    except: pass\n\")",
+      "Bash(printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"1.0\"}}}\\\\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}\\\\n' | timeout 10 .build/debug/swift-lens --project . 2>/dev/null)",
+      "Bash(printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"1.0\"}}}\\\\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}\\\\n' | /usr/bin/timeout 10 .build/debug/swift-lens --project . 2>/dev/null || printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"1.0\"}}}\\\\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}\\\\n' | gtimeout 10 .build/debug/swift-lens --project . 2>/dev/null || true)",
+      "Bash(echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"1.0\"}}}' | ~/.local/bin/swift-lens --project-root /Users/markusskov/Documents/Ryvus 2>/dev/null | head -5)",
+      "Bash(python3 /tmp/test_callgraph.py 2>&1)",
+      "Bash(log show:*)",
+      "WebSearch",
+      "Bash(curl -sL \"https://api.github.com/repos/swiftlang/indexstore-db/tags?per_page=5\" | python3 -c \"import sys,json; [print\\(t['name']\\) for t in json.load\\(sys.stdin\\)]\")",
+      "Bash(curl -sL \"https://api.github.com/repos/swiftlang/indexstore-db/releases?per_page=5\" | python3 -c \"import sys,json; [print\\(r.get\\('tag_name',''\\), r.get\\('name',''\\)\\) for r in json.load\\(sys.stdin\\)]\" 2>/dev/null; echo \"---\"; curl -sL \"https://api.github.com/repos/swiftlang/indexstore-db/tags?per_page=100\" | python3 -c \"import sys,json; [print\\(t['name']\\) for t in json.load\\(sys.stdin\\) if not t['name'].startswith\\('swift-'\\)]\" 2>/dev/null)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:api.github.com)"
+    ]
+  }
+}
