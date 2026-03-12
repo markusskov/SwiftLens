@@ -45,9 +45,11 @@ struct ToolHandlers: Sendable {
         case "impact_analysis":
             return try handleImpactAnalysis(args)
         case "check_environment_injection":
-            return try handleCheckEnvironmentInjection()
+            return try handleCheckEnvironmentInjection(args)
         case "audit_access_control":
             return try handleAuditAccessControl(args)
+        case "module_api":
+            return try handleModuleApi(args)
         case "diff_since":
             return try handleDiffSince(args)
         case "test_coverage":
@@ -94,6 +96,9 @@ struct ToolHandlers: Sendable {
         var output = "\(kind) \(qualifiedName) — \(shortenPath(filePath)):\(startLine)"
         if let endLine = result.endLine, endLine != startLine {
             output += "-\(endLine)"
+        }
+        if result.stale {
+            output += "\n\nWARNING: File has been modified since last index. Line numbers may be inaccurate. Run reindex to update."
         }
         output += "\n\n\(source)\n"
 
@@ -670,17 +675,20 @@ struct ToolHandlers: Sendable {
         return CallTool.Result(content: [.text(output)])
     }
 
-    private func handleCheckEnvironmentInjection() throws -> CallTool.Result {
-        let results = try queryEngine.checkEnvironmentInjection(projectId: projectId)
+    private func handleCheckEnvironmentInjection(_ args: [String: Value]) throws -> CallTool.Result {
+        let rootView = args["root_view"]?.stringValue
+        let results = try queryEngine.checkEnvironmentInjection(projectId: projectId, rootView: rootView)
 
         if results.isEmpty {
-            return CallTool.Result(content: [.text("No @Environment usages found.")])
+            let scope = rootView.map { " in \($0) subtree" } ?? ""
+            return CallTool.Result(content: [.text("No @Environment usages found\(scope).")])
         }
 
         let missing = results.filter { $0.status == .missing }
         let provided = results.filter { $0.status == .provided }
 
-        var output = "Environment Injection Check (\(results.count) usages):\n\n"
+        let scope = rootView.map { " [scoped to \($0)]" } ?? ""
+        var output = "Environment Injection Check (\(results.count) usages)\(scope):\n\n"
 
         if !missing.isEmpty {
             output += "MISSING INJECTIONS (\(missing.count)) — potential runtime crashes:\n"
@@ -731,6 +739,74 @@ struct ToolHandlers: Sendable {
         }
 
         output += "\nNote: Analysis based on structural edges (conformsTo, inherits, composesView, usesEnvironment). Type references in function parameters/return types are not yet tracked."
+        return CallTool.Result(content: [.text(output)])
+    }
+
+    private func handleModuleApi(_ args: [String: Value]) throws -> CallTool.Result {
+        guard let module = args["module"]?.stringValue else {
+            return CallTool.Result(content: [.text("Missing required parameter: module")], isError: true)
+        }
+
+        let accessLevel = args["access_level"]?.stringValue ?? "public"
+        let kind = args["kind"]?.stringValue.flatMap { NodeKind(rawValue: $0) }
+
+        let result = try queryEngine.moduleApi(
+            projectId: projectId,
+            module: module,
+            accessLevel: accessLevel,
+            kind: kind
+        )
+
+        let total = result.types.count + result.functions.count + result.variables.count
+        if total == 0 {
+            return CallTool.Result(content: [.text("No \(accessLevel) API found in module '\(module)'. Check the module name with get_module_graph.")])
+        }
+
+        var output = "Module API: \(module) (\(total) symbols, access: \(accessLevel))\n"
+
+        if !result.types.isEmpty {
+            output += "\n--- Types (\(result.types.count)) ---\n"
+            for entry in result.types {
+                output += "\n  \(entry.accessLevel) \(entry.kind) \(entry.name)"
+                if let sig = entry.signature { output += " \(sig)" }
+                if let path = entry.filePath, let line = entry.line {
+                    output += " — \(shortenPath(path)):\(line)"
+                }
+                if !entry.members.isEmpty {
+                    for member in entry.members {
+                        let access = member.accessLevel.map { "\($0) " } ?? ""
+                        output += "\n    \(access)\(member.kind) \(member.name)"
+                        if let sig = member.signature { output += " \(sig)" }
+                    }
+                }
+                output += "\n"
+            }
+        }
+
+        if !result.functions.isEmpty {
+            output += "\n--- Functions (\(result.functions.count)) ---\n"
+            for entry in result.functions {
+                output += "  \(entry.accessLevel) func \(entry.name)"
+                if let sig = entry.signature { output += " \(sig)" }
+                if let path = entry.filePath, let line = entry.line {
+                    output += " — \(shortenPath(path)):\(line)"
+                }
+                output += "\n"
+            }
+        }
+
+        if !result.variables.isEmpty {
+            output += "\n--- Variables (\(result.variables.count)) ---\n"
+            for entry in result.variables {
+                output += "  \(entry.accessLevel) var \(entry.name)"
+                if let sig = entry.signature { output += ": \(sig)" }
+                if let path = entry.filePath, let line = entry.line {
+                    output += " — \(shortenPath(path)):\(line)"
+                }
+                output += "\n"
+            }
+        }
+
         return CallTool.Result(content: [.text(output)])
     }
 

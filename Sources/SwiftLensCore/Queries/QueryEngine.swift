@@ -72,11 +72,23 @@ public struct QueryEngine: Sendable {
             return ReadSymbolResult(
                 symbolName: name, kind: nil, qualifiedName: nil,
                 filePath: nil, startLine: nil, endLine: nil,
-                source: nil, suggestions: suggestions
+                source: nil, suggestions: suggestions, stale: false
             )
         }
 
         let endLine = record.endLine ?? startLine
+
+        // Check if file changed since last index (staleness detection)
+        let stale: Bool = {
+            guard let storedHash = try? db.dbWriter.read({ db in
+                try String.fetchOne(db, sql: """
+                    SELECT sha256 FROM file_hashes
+                    WHERE projectId = ? AND filePath = ?
+                    """, arguments: [projectId, filePath])
+            }) else { return false }
+            guard let currentHash = try? FileHasher().hash(filePath: filePath) else { return false }
+            return storedHash != currentHash
+        }()
 
         // Read source from disk
         let readStart = max(1, startLine - contextLines)
@@ -108,7 +120,8 @@ public struct QueryEngine: Sendable {
             startLine: startLine,
             endLine: endLine,
             source: source,
-            suggestions: nil
+            suggestions: nil,
+            stale: stale
         )
     }
 
@@ -1247,10 +1260,41 @@ public struct QueryEngine: Sendable {
     ]
 
     /// Check for missing @Environment injections by walking the view tree.
+    /// Optionally scoped to a view subtree rooted at `rootView`.
     public func checkEnvironmentInjection(
-        projectId: Int64
+        projectId: Int64,
+        rootView: String? = nil
     ) throws -> [EnvironmentInjectionCheck] {
         try db.dbWriter.read { db in
+            // If rootView is specified, collect all view IDs in that subtree
+            let subtreeViewIds: Set<Int64>?
+            if let rootView {
+                let rootRow = try Row.fetchOne(db, sql: """
+                    SELECT id FROM symbols
+                    WHERE projectId = ? AND name = ?
+                      AND kind IN ('struct', 'class')
+                      AND qualifiedName NOT LIKE 'unresolved:%'
+                    LIMIT 1
+                    """, arguments: [projectId, rootView])
+                guard let rootId: Int64 = rootRow?["id"] else {
+                    return [] // root view not found
+                }
+                let descendants = try Row.fetchAll(db, sql: """
+                    WITH RECURSIVE subtree(viewId, depth) AS (
+                        SELECT ?, 0
+                        UNION ALL
+                        SELECT e.targetId, s.depth + 1
+                        FROM subtree s
+                        JOIN edges e ON e.sourceId = s.viewId AND e.kind = ?
+                        WHERE s.depth < 50
+                    )
+                    SELECT viewId FROM subtree
+                    """, arguments: [rootId, EdgeKind.composesView.rawValue])
+                subtreeViewIds = Set(descendants.map { $0["viewId"] as Int64 })
+            } else {
+                subtreeViewIds = nil
+            }
+
             // Get all @Environment usages: view → keyPath
             let usages = try Row.fetchAll(db, sql: """
                 SELECT
@@ -1270,7 +1314,13 @@ public struct QueryEngine: Sendable {
                 .filter { row in
                     // Exclude system-provided environment keys
                     let keyPath: String = row["keyPath"]
-                    return !Self.systemEnvironmentKeys.contains(keyPath)
+                    if Self.systemEnvironmentKeys.contains(keyPath) { return false }
+                    // Filter to subtree if rootView was specified
+                    if let subtreeViewIds {
+                        let viewId: Int64 = row["viewId"]
+                        return subtreeViewIds.contains(viewId)
+                    }
+                    return true
                 }
 
             var results: [EnvironmentInjectionCheck] = []
@@ -1433,6 +1483,109 @@ public struct QueryEngine: Sendable {
             }
 
             return issues
+        }
+    }
+
+    // MARK: - module_api
+
+    /// List the public API surface of a module — all public/open types and their public members.
+    public func moduleApi(
+        projectId: Int64,
+        module: String,
+        accessLevel: String = "public",
+        kind: NodeKind? = nil
+    ) throws -> ModuleApiResult {
+        try db.dbWriter.read { db in
+            let accessLevels: [String]
+            switch accessLevel {
+            case "public": accessLevels = ["public", "open"]
+            case "internal": accessLevels = ["public", "open", "internal"]
+            case "all": accessLevels = ["public", "open", "internal", "fileprivate", "private"]
+            default: accessLevels = ["public", "open"]
+            }
+
+            let placeholders = accessLevels.map { _ in "?" }.joined(separator: ", ")
+
+            var sql = """
+                SELECT s.id, s.name, s.qualifiedName, s.kind, s.accessLevel,
+                       s.signature, s.filePath, s.line
+                FROM symbols s
+                JOIN modules m ON s.moduleId = m.id
+                WHERE s.projectId = ?
+                  AND m.name = ?
+                  AND s.accessLevel IN (\(placeholders))
+                  AND s.kind IN ('struct', 'class', 'enum', 'actor', 'protocol', 'function', 'variable', 'typeAlias')
+                  AND s.qualifiedName NOT LIKE 'unresolved:%'
+                  AND s.qualifiedName NOT LIKE 'file:%'
+                """
+            var arguments: [any DatabaseValueConvertible] = [projectId, module] + accessLevels
+
+            if let kind {
+                sql += " AND s.kind = ?"
+                arguments.append(kind.rawValue)
+            }
+
+            sql += " ORDER BY s.kind, s.name"
+
+            let rows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(arguments))
+
+            var types: [ModuleApiEntry] = []
+            var functions: [ModuleApiEntry] = []
+            var variables: [ModuleApiEntry] = []
+
+            for row in rows {
+                let symbolId: Int64 = row["id"]
+                let symbolKind: String = row["kind"]
+
+                // Fetch public members for type symbols
+                var members: [ModuleApiMember] = []
+                let isType = ["struct", "class", "enum", "actor", "protocol"].contains(symbolKind)
+                if isType {
+                    let memberRows = try Row.fetchAll(db, sql: """
+                        SELECT s2.name, s2.kind, s2.accessLevel, s2.signature
+                        FROM edges e
+                        JOIN symbols s2 ON e.targetId = s2.id
+                        WHERE e.sourceId = ?
+                          AND e.kind = 'contains'
+                          AND s2.kind IN ('function', 'variable', 'initializer', 'typeAlias', 'enum', 'struct')
+                          AND (s2.accessLevel IN (\(placeholders)) OR s2.accessLevel IS NULL)
+                        ORDER BY s2.kind, s2.name
+                        """, arguments: StatementArguments([symbolId] + accessLevels.map { $0 as any DatabaseValueConvertible }))
+
+                    members = memberRows.map { mRow in
+                        ModuleApiMember(
+                            name: mRow["name"],
+                            kind: mRow["kind"],
+                            accessLevel: mRow["accessLevel"],
+                            signature: mRow["signature"]
+                        )
+                    }
+                }
+
+                let entry = ModuleApiEntry(
+                    name: row["name"],
+                    qualifiedName: row["qualifiedName"],
+                    kind: symbolKind,
+                    accessLevel: row["accessLevel"],
+                    signature: row["signature"],
+                    filePath: row["filePath"],
+                    line: row["line"],
+                    members: members
+                )
+
+                switch symbolKind {
+                case "function": functions.append(entry)
+                case "variable": variables.append(entry)
+                default: types.append(entry)
+                }
+            }
+
+            return ModuleApiResult(
+                moduleName: module,
+                types: types,
+                functions: functions,
+                variables: variables
+            )
         }
     }
 
@@ -2021,6 +2174,7 @@ public struct ReadSymbolResult: Sendable {
     public let endLine: Int?
     public let source: String?          // Numbered source lines
     public let suggestions: [String]?   // Set when symbol not found
+    public let stale: Bool              // True when file changed since last index
 }
 
 // MARK: - Usage Result Types
@@ -2052,6 +2206,33 @@ public struct AccessControlIssue: Sendable {
     public let filePath: String?
     public let line: Int?
     public let moduleName: String?
+}
+
+// MARK: - Module API Types
+
+public struct ModuleApiResult: Sendable {
+    public let moduleName: String
+    public let types: [ModuleApiEntry]
+    public let functions: [ModuleApiEntry]
+    public let variables: [ModuleApiEntry]
+}
+
+public struct ModuleApiEntry: Sendable {
+    public let name: String
+    public let qualifiedName: String
+    public let kind: String
+    public let accessLevel: String
+    public let signature: String?
+    public let filePath: String?
+    public let line: Int?
+    public let members: [ModuleApiMember]
+}
+
+public struct ModuleApiMember: Sendable {
+    public let name: String
+    public let kind: String
+    public let accessLevel: String?
+    public let signature: String?
 }
 
 // MARK: - Diff Since Types

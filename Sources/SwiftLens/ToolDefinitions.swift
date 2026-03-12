@@ -21,6 +21,7 @@ enum ToolDefinitions {
         impactAnalysis,
         checkEnvironmentInjection,
         auditAccessControl,
+        moduleApi,
         diffSince,
         testCoverage,
         crossModuleUsage,
@@ -326,10 +327,15 @@ enum ToolDefinitions {
 
     static let checkEnvironmentInjection = Tool(
         name: "check_environment_injection",
-        description: "Check for missing @Environment injections. Cross-references view tree with .environment() modifier calls to find views that read an @Environment key but no ancestor provides it — which would cause a runtime crash.",
+        description: "Check for missing @Environment injections. Cross-references view tree with .environment() modifier calls to find views that read an @Environment key but no ancestor provides it — which would cause a runtime crash. Optionally scope to a specific view subtree.",
         inputSchema: .object([
             "type": .string("object"),
-            "properties": .object([:]),
+            "properties": .object([
+                "root_view": .object([
+                    "type": .string("string"),
+                    "description": .string("Root view name to scope the check to (e.g. 'AppView'). Only checks views within this subtree. Omit to check the entire project."),
+                ]),
+            ]),
         ]),
         annotations: .init(readOnlyHint: true)
     )
@@ -354,6 +360,36 @@ enum ToolDefinitions {
                     ]),
                 ]),
             ]),
+        ]),
+        annotations: .init(readOnlyHint: true)
+    )
+
+    static let moduleApi = Tool(
+        name: "module_api",
+        description: "List the public API surface of a module — all exported types, functions, and variables with their members and signatures. Essential for cross-module planning: shows what a module exposes without reading every file.",
+        inputSchema: .object([
+            "type": .string("object"),
+            "properties": .object([
+                "module": .object([
+                    "type": .string("string"),
+                    "description": .string("SPM module name (e.g. 'RyvusDomain', 'SwiftLensCore')"),
+                ]),
+                "access_level": .object([
+                    "type": .string("string"),
+                    "description": .string("Minimum access level to include: 'public' (default — public/open only), 'internal' (public + internal), 'all' (everything)"),
+                    "enum": .array([.string("public"), .string("internal"), .string("all")]),
+                ]),
+                "kind": .object([
+                    "type": .string("string"),
+                    "description": .string("Filter to a specific symbol kind"),
+                    "enum": .array([
+                        .string("struct"), .string("class"), .string("enum"),
+                        .string("protocol"), .string("actor"), .string("function"),
+                        .string("variable"), .string("typeAlias"),
+                    ]),
+                ]),
+            ]),
+            "required": .array([.string("module")]),
         ]),
         annotations: .init(readOnlyHint: true)
     )
