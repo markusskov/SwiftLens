@@ -136,6 +136,7 @@ final class DeclarationVisitor: SyntaxVisitor {
 
     override func visit(_ node: FunctionDeclSyntax) -> SyntaxVisitorContinueKind {
         let location = node.startLocation(converter: converter)
+        let endLocation = node.endLocation(converter: converter)
         let sig = buildFunctionSignature(node)
 
         let decl = ExtractedDeclaration(
@@ -143,6 +144,7 @@ final class DeclarationVisitor: SyntaxVisitor {
             name: node.name.text,
             line: location.line,
             column: location.column,
+            endLine: endLocation.line,
             accessLevel: extractAccessLevel(node.modifiers),
             attributes: extractAttributes(node.attributes),
             modifiers: extractModifiers(node.modifiers),
@@ -156,6 +158,7 @@ final class DeclarationVisitor: SyntaxVisitor {
 
     override func visit(_ node: VariableDeclSyntax) -> SyntaxVisitorContinueKind {
         let location = node.startLocation(converter: converter)
+        let endLocation = node.endLocation(converter: converter)
         let attrs = extractAttributes(node.attributes)
         let mods = extractModifiers(node.modifiers)
 
@@ -175,6 +178,7 @@ final class DeclarationVisitor: SyntaxVisitor {
                 name: name,
                 line: location.line,
                 column: location.column,
+                endLine: endLocation.line,
                 accessLevel: extractAccessLevel(node.modifiers),
                 attributes: attrs,
                 modifiers: mods,
@@ -189,6 +193,7 @@ final class DeclarationVisitor: SyntaxVisitor {
 
     override func visit(_ node: InitializerDeclSyntax) -> SyntaxVisitorContinueKind {
         let location = node.startLocation(converter: converter)
+        let endLocation = node.endLocation(converter: converter)
         let params: String = node.signature.parameterClause.parameters.map { param -> String in
             let label = param.firstName.text
             let type = param.type.trimmedDescription
@@ -205,6 +210,7 @@ final class DeclarationVisitor: SyntaxVisitor {
             name: "init" + failable,
             line: location.line,
             column: location.column,
+            endLine: endLocation.line,
             accessLevel: extractAccessLevel(node.modifiers),
             attributes: extractAttributes(node.attributes),
             modifiers: extractModifiers(node.modifiers),
@@ -218,11 +224,13 @@ final class DeclarationVisitor: SyntaxVisitor {
 
     override func visit(_ node: TypeAliasDeclSyntax) -> SyntaxVisitorContinueKind {
         let location = node.startLocation(converter: converter)
+        let endLocation = node.endLocation(converter: converter)
         let decl = ExtractedDeclaration(
             kind: .typeAlias,
             name: node.name.text,
             line: location.line,
             column: location.column,
+            endLine: endLocation.line,
             accessLevel: extractAccessLevel(node.modifiers),
             attributes: extractAttributes(node.attributes),
             modifiers: extractModifiers(node.modifiers),
@@ -236,6 +244,7 @@ final class DeclarationVisitor: SyntaxVisitor {
 
     override func visit(_ node: EnumCaseDeclSyntax) -> SyntaxVisitorContinueKind {
         let location = node.startLocation(converter: converter)
+        let endLocation = node.endLocation(converter: converter)
         for element in node.elements {
             let sig: String?
             if let params = element.parameterClause {
@@ -251,6 +260,7 @@ final class DeclarationVisitor: SyntaxVisitor {
                 name: element.name.text,
                 line: location.line,
                 column: location.column,
+                endLine: endLocation.line,
                 accessLevel: nil,
                 signature: sig,
                 parent: currentParent
