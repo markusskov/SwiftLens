@@ -1772,9 +1772,12 @@ public struct QueryEngine: Sendable {
                 SELECT s.id, s.name, s.qualifiedName, s.kind, s.accessLevel,
                        s.signature, s.filePath, s.line
                 FROM symbols s
-                JOIN modules m ON s.moduleId = m.id
+                LEFT JOIN modules m ON s.moduleId = m.id
+                LEFT JOIN modules mf ON mf.projectId = s.projectId
+                    AND s.moduleId IS NULL AND mf.path IS NOT NULL
+                    AND s.filePath LIKE '%/' || mf.path || '/%'
                 WHERE s.projectId = ?
-                  AND m.name = ?
+                  AND COALESCE(m.name, mf.name) = ?
                   AND s.accessLevel IN (\(placeholders))
                   AND s.kind IN ('struct', 'class', 'enum', 'actor', 'protocol', 'function', 'variable', 'typeAlias')
                   AND s.qualifiedName NOT LIKE 'unresolved:%'
