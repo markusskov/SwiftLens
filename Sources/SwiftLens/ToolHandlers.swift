@@ -58,6 +58,8 @@ struct ToolHandlers: Sendable {
             return try handleCrossModuleUsage(args)
         case "trace_call_graph":
             return try handleTraceCallGraph(args)
+        case "preview_rename":
+            return try handlePreviewRename(args)
         default:
             return CallTool.Result(
                 content: [.text("Unknown tool: \(params.name)")],
@@ -1362,5 +1364,58 @@ struct ToolHandlers: Sendable {
             output += formatViewTree(child, indent: indent + 1)
         }
         return output
+    }
+
+    // MARK: - preview_rename
+
+    private func handlePreviewRename(_ args: [String: Value]) throws -> CallTool.Result {
+        guard let symbol = args["symbol"]?.stringValue else {
+            return CallTool.Result(content: [.text("Missing required parameter: symbol")], isError: true)
+        }
+        guard let newName = args["new_name"]?.stringValue else {
+            return CallTool.Result(content: [.text("Missing required parameter: new_name")], isError: true)
+        }
+
+        let result = try queryEngine.previewRename(
+            projectId: projectId,
+            symbolName: symbol,
+            newName: newName
+        )
+
+        if result.sites.isEmpty {
+            if result.symbolKind == "unknown" {
+                var msg = "Symbol '" + symbol + "' not found."
+                if let suggestions = result.suggestions, !suggestions.isEmpty {
+                    msg += " Did you mean:\n" + suggestions.map { "  - " + $0 }.joined(separator: "\n")
+                }
+                return CallTool.Result(content: [.text(msg)])
+            }
+            return CallTool.Result(content: [.text("No rename sites found for " + result.symbolKind + " '" + symbol + "'")])
+        }
+
+        let simpleName = symbol.contains(".") ? String(symbol.split(separator: ".").last!) : symbol
+        var output = "Rename preview: " + result.symbolKind + " " + simpleName + " → " + newName + "\n"
+        output += String(result.sites.count) + " site(s) across "
+
+        let fileCount = Set(result.sites.map(\.filePath)).count
+        output += String(fileCount) + " file(s):\n"
+
+        // Group by file
+        let grouped = Dictionary(grouping: result.sites) { $0.filePath }
+        let sortedFiles = grouped.keys.sorted()
+
+        for file in sortedFiles {
+            let sites = grouped[file]!
+            output += "\n  " + shortenPath(file) + ":\n"
+            for site in sites {
+                let lineStr = "L" + String(site.line)
+                output += "    " + lineStr + " [" + site.category + "]  " + site.currentText.trimmingCharacters(in: .whitespaces) + "\n"
+            }
+        }
+
+        output += "\nTo apply: rename '" + simpleName + "' → '" + newName + "' at each site above."
+        output += "\nNote: String literals and comments are not tracked — review manually if needed."
+
+        return CallTool.Result(content: [.text(output)])
     }
 }

@@ -669,6 +669,268 @@ public struct QueryEngine: Sendable {
         }
     }
 
+    // MARK: - preview_rename
+
+    /// Preview all sites that would need updating when renaming a symbol.
+    public func previewRename(
+        projectId: Int64,
+        symbolName: String,
+        newName: String
+    ) throws -> RenamePreviewResult {
+        try db.dbWriter.read { db in
+            // Look up the symbol using same strategy as findUsages
+            var symbol = try SymbolRecord
+                .filter(Column("projectId") == projectId)
+                .filter(Column("name") == symbolName)
+                .filter(Column("kind") != NodeKind.extension.rawValue)
+                .filter(Column("kind") != NodeKind.file.rawValue)
+                .filter(Column("kind") != NodeKind.module.rawValue)
+                .filter(sql: "qualifiedName NOT LIKE 'unresolved:%'")
+                .fetchOne(db)
+
+            if symbol == nil {
+                symbol = try SymbolRecord
+                    .filter(Column("projectId") == projectId)
+                    .filter(Column("qualifiedName") == symbolName)
+                    .filter(sql: "qualifiedName NOT LIKE 'unresolved:%'")
+                    .fetchOne(db)
+            }
+
+            if symbol == nil {
+                let suggestions = try Row.fetchAll(db, sql: """
+                    SELECT s.name, s.qualifiedName, s.kind
+                    FROM symbols s
+                    JOIN symbols_fts ON symbols_fts.rowid = s.rowid
+                    WHERE symbols_fts MATCH ?
+                    AND s.projectId = ?
+                    AND s.qualifiedName NOT LIKE 'unresolved:%'
+                    AND s.kind NOT IN ('file', 'module', 'extension')
+                    ORDER BY rank LIMIT 5
+                    """, arguments: [ftsQuery(symbolName), projectId])
+
+                let suggestionNames = suggestions.map { (row: Row) -> String in
+                    let name: String = row["name"]
+                    let qn: String = row["qualifiedName"]
+                    let kind: String = row["kind"]
+                    return kind + " " + (qn == name ? name : qn)
+                }
+
+                return RenamePreviewResult(
+                    symbolName: symbolName, symbolKind: "unknown",
+                    newName: newName, sites: [], suggestions: suggestionNames
+                )
+            }
+
+            guard let symbol else {
+                return RenamePreviewResult(
+                    symbolName: symbolName, symbolKind: "unknown",
+                    newName: newName, sites: []
+                )
+            }
+
+            let typeKinds: Set<String> = ["struct", "class", "enum", "actor", "protocol", "typeAlias"]
+            let isType = typeKinds.contains(symbol.kind)
+            let simpleName = symbolName.contains(".") ? String(symbolName.split(separator: ".").last!) : symbolName
+
+            var sites: [RenameSite] = []
+            var seen = Set<String>() // "filePath:line" dedup
+
+            // Helper to read a source line from disk
+            func sourceLine(at path: String, line lineNum: Int) -> String? {
+                guard let data = FileManager.default.contents(atPath: path),
+                      let content = String(data: data, encoding: .utf8) else { return nil }
+                let lines = content.components(separatedBy: "\n")
+                guard lineNum >= 1, lineNum <= lines.count else { return nil }
+                return lines[lineNum - 1]
+            }
+
+            func addSite(filePath: String?, line: Int?, column: Int?, category: String) {
+                guard let fp = filePath, let ln = line, ln > 0 else { return }
+                let key = fp + ":" + String(ln)
+                guard seen.insert(key).inserted else { return }
+                let text = sourceLine(at: fp, line: ln) ?? ""
+                sites.append(RenameSite(
+                    filePath: fp, line: ln, column: column,
+                    category: category, currentText: text
+                ))
+            }
+
+            // 1. Declaration site
+            addSite(filePath: symbol.filePath, line: symbol.line,
+                    column: symbol.column, category: "declaration")
+
+            if isType {
+                // 2. Type references (annotations, init calls, static access)
+                let refs = try Row.fetchAll(db, sql: """
+                    SELECT tr.filePath, tr.line
+                    FROM type_references tr
+                    WHERE tr.projectId = ? AND tr.referencedTypeName = ?
+                    ORDER BY tr.filePath, tr.line
+                    """, arguments: [projectId, simpleName])
+
+                for row in refs {
+                    addSite(filePath: row["filePath"], line: row["line"],
+                            column: nil, category: "type reference")
+                }
+
+                // 3. Inheritance clauses — symbols whose inheritedTypes JSON contains this name
+                let inheritRows = try Row.fetchAll(db, sql: """
+                    SELECT s.filePath, s.line
+                    FROM symbols s
+                    WHERE s.projectId = ?
+                    AND s.inheritedTypes LIKE ?
+                    AND s.kind NOT IN ('file', 'module')
+                    AND s.qualifiedName NOT LIKE 'unresolved:%'
+                    ORDER BY s.filePath, s.line
+                    """, arguments: [projectId, "%" + simpleName + "%"])
+
+                for row in inheritRows {
+                    // Verify the name is actually in the JSON array, not a substring match
+                    addSite(filePath: row["filePath"], line: row["line"],
+                            column: nil, category: "inheritance")
+                }
+
+                // 4. Extension declarations
+                let extRows = try Row.fetchAll(db, sql: """
+                    SELECT s.filePath, s.line
+                    FROM symbols s
+                    WHERE s.projectId = ? AND s.kind = 'extension' AND s.name = ?
+                    ORDER BY s.filePath, s.line
+                    """, arguments: [projectId, simpleName])
+
+                for row in extRows {
+                    addSite(filePath: row["filePath"], line: row["line"],
+                            column: nil, category: "extension")
+                }
+
+                // 5. Function calls where the type name appears in source:
+                // - staticCall: Type.method() — type name is in the source
+                // - initCall: Type() — type name is the callee
+                // NOT instanceCall — those use a variable name, not the type name
+                let callRows = try Row.fetchAll(db, sql: """
+                    SELECT fc.filePath, fc.line, fc.column
+                    FROM function_calls fc
+                    WHERE fc.projectId = ?
+                    AND (
+                        (fc.receiverType = ? AND fc.callKind = 'staticCall')
+                        OR (fc.calleeName = ? AND fc.callKind = 'initCall')
+                    )
+                    ORDER BY fc.filePath, fc.line
+                    """, arguments: [projectId, simpleName, simpleName])
+
+                for row in callRows {
+                    addSite(filePath: row["filePath"], line: row["line"],
+                            column: row["column"], category: "function call")
+                }
+            } else {
+                // Member (function, variable, initializer, enumCase, etc.)
+
+                // Find parent type for scoping
+                let parentRow = try Row.fetchOne(db, sql: """
+                    SELECT s.name, s.id FROM symbols s
+                    JOIN edges e ON e.sourceId = s.id AND e.kind = ?
+                    WHERE e.targetId = ?
+                    AND s.kind IN ('struct', 'class', 'enum', 'actor', 'protocol')
+                    LIMIT 1
+                    """, arguments: [EdgeKind.contains.rawValue, symbol.id!])
+                let parentTypeName: String? = parentRow?["name"]
+
+                // Function calls matching this member
+                if symbol.kind == "function" || symbol.kind == "initializer" {
+                    var callSQL = """
+                        SELECT fc.filePath, fc.line, fc.column
+                        FROM function_calls fc
+                        WHERE fc.projectId = ? AND fc.calleeName = ?
+                        """
+                    var callArgs: [DatabaseValueConvertible] = [projectId, simpleName]
+
+                    if let parent = parentTypeName {
+                        // Scope to calls on this specific type
+                        callSQL += " AND (fc.receiverType = ? OR fc.callKind IN ('selfCall', 'superCall'))"
+                        callArgs.append(parent)
+                    }
+                    callSQL += " ORDER BY fc.filePath, fc.line"
+
+                    let callRows = try Row.fetchAll(db, sql: callSQL, arguments: StatementArguments(callArgs))
+
+                    for row in callRows {
+                        addSite(filePath: row["filePath"], line: row["line"],
+                                column: row["column"], category: "function call")
+                    }
+                }
+
+                // For protocol requirements: find implementations via implementsRequirement edges
+                if let parentRow, let parentId: Int64 = parentRow["id"] {
+                    // Check if the parent is a protocol — if so, find implementors
+                    let parentKind = try String.fetchOne(db, sql: """
+                        SELECT kind FROM symbols WHERE id = ?
+                        """, arguments: [parentId])
+
+                    if parentKind == "protocol" {
+                        // Find concrete implementations of this requirement
+                        let implRows = try Row.fetchAll(db, sql: """
+                            SELECT s.filePath, s.line, s.column
+                            FROM edges e
+                            JOIN symbols s ON s.id = e.sourceId
+                            WHERE e.targetId = ? AND e.kind = 'implementsRequirement'
+                            ORDER BY s.filePath, s.line
+                            """, arguments: [symbol.id!])
+
+                        for row in implRows {
+                            addSite(filePath: row["filePath"], line: row["line"],
+                                    column: row["column"], category: "protocol implementation")
+                        }
+                    }
+                }
+
+                // Check if this member overrides something — find other overrides of same base
+                let overrideTargets = try Row.fetchAll(db, sql: """
+                    SELECT e.targetId FROM edges e
+                    WHERE e.sourceId = ? AND e.kind = 'overrides'
+                    """, arguments: [symbol.id!])
+
+                for targetRow in overrideTargets {
+                    let baseId: Int64 = targetRow["targetId"]
+                    // Find all other overrides of the same base
+                    let siblingOverrides = try Row.fetchAll(db, sql: """
+                        SELECT s.filePath, s.line, s.column
+                        FROM edges e
+                        JOIN symbols s ON s.id = e.sourceId
+                        WHERE e.targetId = ? AND e.kind = 'overrides' AND e.sourceId != ?
+                        ORDER BY s.filePath, s.line
+                        """, arguments: [baseId, symbol.id!])
+
+                    for row in siblingOverrides {
+                        addSite(filePath: row["filePath"], line: row["line"],
+                                column: row["column"], category: "override")
+                    }
+
+                    // Also include the base method itself
+                    let baseRow = try Row.fetchOne(db, sql: """
+                        SELECT filePath, line, column FROM symbols WHERE id = ?
+                        """, arguments: [baseId])
+                    if let baseRow {
+                        addSite(filePath: baseRow["filePath"], line: baseRow["line"],
+                                column: baseRow["column"], category: "overridden base")
+                    }
+                }
+            }
+
+            // Sort by file then line
+            let sorted = sites.sorted {
+                if $0.filePath != $1.filePath { return $0.filePath < $1.filePath }
+                return $0.line < $1.line
+            }
+
+            return RenamePreviewResult(
+                symbolName: symbolName,
+                symbolKind: symbol.kind,
+                newName: newName,
+                sites: sorted
+            )
+        }
+    }
+
     // MARK: - find_dependencies
 
     /// Find bidirectional dependencies of a symbol.
@@ -2297,4 +2559,22 @@ public struct CrossModuleEntry: Sendable {
     public let filePath: String?
     public let line: Int?
     public let usageCount: Int
+}
+
+// MARK: - Rename Preview Types
+
+public struct RenamePreviewResult: Sendable {
+    public let symbolName: String
+    public let symbolKind: String
+    public let newName: String
+    public let sites: [RenameSite]
+    public var suggestions: [String]?
+}
+
+public struct RenameSite: Sendable {
+    public let filePath: String
+    public let line: Int
+    public let column: Int?
+    public let category: String     // "declaration", "type reference", "function call", "inheritance", "extension"
+    public let currentText: String  // the source line
 }

@@ -26,6 +26,7 @@ enum ToolDefinitions {
         testCoverage,
         crossModuleUsage,
         traceCallGraph,
+        previewRename,
     ]
 
     static let readSymbol = Tool(
@@ -474,6 +475,26 @@ enum ToolDefinitions {
                 ]),
             ]),
             "required": .array([.string("function")]),
+        ]),
+        annotations: .init(readOnlyHint: true)
+    )
+
+    static let previewRename = Tool(
+        name: "preview_rename",
+        description: "Preview all code locations that would need updating when renaming a symbol. Shows the declaration, type references, call sites, inheritance clauses, and extensions — with the actual source line at each location. Does NOT modify any files. Use the output to apply edits manually or with an AI agent.",
+        inputSchema: .object([
+            "type": .string("object"),
+            "properties": .object([
+                "symbol": .object([
+                    "type": .string("string"),
+                    "description": .string("Symbol name or qualified name to rename (e.g. 'MovieService', 'ProfileManager.createProfile')"),
+                ]),
+                "new_name": .object([
+                    "type": .string("string"),
+                    "description": .string("The new name for the symbol"),
+                ]),
+            ]),
+            "required": .array([.string("symbol"), .string("new_name")]),
         ]),
         annotations: .init(readOnlyHint: true)
     )
