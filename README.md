@@ -1,6 +1,6 @@
 # SwiftLens
 
-A Swift-native [MCP](https://modelcontextprotocol.io) server that builds a code knowledge graph for Swift projects. It parses your codebase using [swift-syntax](https://github.com/swiftlang/swift-syntax), stores symbols and relationships in a SQLite graph database, and exposes 19 query tools over the Model Context Protocol — giving AI assistants deep, structured understanding of your Swift code.
+A Swift-native [MCP](https://modelcontextprotocol.io) server that builds a code knowledge graph for Swift projects. It parses your codebase using [swift-syntax](https://github.com/swiftlang/swift-syntax), stores symbols and relationships in a SQLite graph database, and exposes 20 query tools over the Model Context Protocol — giving AI assistants deep, structured understanding of your Swift code.
 
 ## Features
 
@@ -13,13 +13,14 @@ A Swift-native [MCP](https://modelcontextprotocol.io) server that builds a code 
 
 | Tool | Description |
 |---|---|
+| `read_symbol` | Read the full source implementation of a symbol — actual code, not just metadata |
 | `search_symbol` | FTS5 search by name, attribute (`@Observable`, `@State`, etc.), kind, or module |
 | `get_symbol` | Full symbol details — members, conformances, extensions, wrappers |
 | `symbols_in_file` | All symbols in a file, ordered by line number |
-| `find_usages` | Where a symbol is referenced (type annotations, init calls, static access) |
-| `find_conformers` | All types conforming to a protocol |
+| `find_usages` | Where a symbol is referenced, with optional source context lines |
+| `find_conformers` | All types conforming to a protocol, with optional requirement coverage |
 | `find_dependencies` | Bidirectional dependency graph for a symbol |
-| `impact_analysis` | Transitive blast radius — full chain of types affected by a change |
+| `impact_analysis` | Transitive blast radius with actionable protocol compile-impact summary |
 | `trace_call_graph` | Function-level caller/callee chains with transitive traversal |
 | `trace_view_tree` | SwiftUI view composition hierarchy from a root view |
 | `check_environment_injection` | Detect missing `@Environment` injections that would crash at runtime |

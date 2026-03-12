@@ -14,6 +14,8 @@ struct ToolHandlers: Sendable {
         let args = params.arguments ?? [:]
 
         switch params.name {
+        case "read_symbol":
+            return try handleReadSymbol(args)
         case "search_symbol":
             return try handleSearchSymbol(args)
         case "get_symbol":
@@ -63,6 +65,40 @@ struct ToolHandlers: Sendable {
     }
 
     // MARK: - Individual Handlers
+
+    private func handleReadSymbol(_ args: [String: Value]) throws -> CallTool.Result {
+        guard let name = args["name"]?.stringValue else {
+            return CallTool.Result(content: [.text("Missing required parameter: name")], isError: true)
+        }
+
+        let contextLines = args["context_lines"]?.intValue ?? 0
+
+        let result = try queryEngine.readSymbol(
+            projectId: projectId,
+            name: name,
+            contextLines: contextLines
+        )
+
+        guard let source = result.source,
+              let kind = result.kind,
+              let qualifiedName = result.qualifiedName,
+              let filePath = result.filePath,
+              let startLine = result.startLine else {
+            var msg = "Symbol '\(name)' not found."
+            if let suggestions = result.suggestions, !suggestions.isEmpty {
+                msg += " Did you mean:\n" + suggestions.map { "  - \($0)" }.joined(separator: "\n")
+            }
+            return CallTool.Result(content: [.text(msg)])
+        }
+
+        var output = "\(kind) \(qualifiedName) — \(shortenPath(filePath)):\(startLine)"
+        if let endLine = result.endLine, endLine != startLine {
+            output += "-\(endLine)"
+        }
+        output += "\n\n\(source)\n"
+
+        return CallTool.Result(content: [.text(output)])
+    }
 
     private func handleSearchSymbol(_ args: [String: Value]) throws -> CallTool.Result {
         let query = args["query"]?.stringValue
@@ -178,6 +214,8 @@ struct ToolHandlers: Sendable {
             return CallTool.Result(content: [.text("Missing required parameter: symbol")], isError: true)
         }
 
+        let contextLines = args["context_lines"]?.intValue ?? 0
+
         let result = try queryEngine.findUsages(projectId: projectId, symbolName: symbol)
 
         if result.usages.isEmpty {
@@ -210,6 +248,14 @@ struct ToolHandlers: Sendable {
                     output += " [\(site.context)]"
                 }
                 output += "\n"
+
+                // Show source context if requested
+                if contextLines > 0, let fp = site.filePath, let ln = site.line {
+                    if let ctx = readSourceContext(filePath: fp, line: ln, contextLines: contextLines) {
+                        output += ctx.split(separator: "\n").map { "      \($0)" }.joined(separator: "\n")
+                        output += "\n"
+                    }
+                }
             }
         }
 
@@ -221,6 +267,8 @@ struct ToolHandlers: Sendable {
             return CallTool.Result(content: [.text("Missing required parameter: protocol")], isError: true)
         }
 
+        let showRequirements = args["show_requirements"]?.boolValue ?? false
+
         let results = try queryEngine.findConformers(projectId: projectId, protocolName: protocolName)
 
         if results.isEmpty {
@@ -228,14 +276,58 @@ struct ToolHandlers: Sendable {
         }
 
         var output = "Types conforming to \(protocolName) (\(results.count)):\n\n"
-        for r in results {
-            output += "  \(r.kind) \(r.name)"
-            if let mod = r.moduleName { output += " [\(mod)]" }
-            if let path = r.filePath, let line = r.line {
-                output += " — \(shortenPath(path)):\(line)"
+
+        if showRequirements {
+            // Use protocol coverage to show implemented/missing per conformer
+            let coverage = try queryEngine.checkProtocolCoverage(
+                projectId: projectId,
+                protocolName: protocolName,
+                showSatisfied: true
+            )
+
+            if !coverage.requirements.isEmpty {
+                output += "Protocol requirements:\n"
+                for req in coverage.requirements {
+                    output += "  \(req.kind) \(req.name)"
+                    if let sig = req.signature { output += ": \(sig)" }
+                    output += "\n"
+                }
+                output += "\n"
             }
-            output += "\n"
+
+            for r in results {
+                output += "  \(r.kind) \(r.name)"
+                if let mod = r.moduleName { output += " [\(mod)]" }
+                if let path = r.filePath, let line = r.line {
+                    output += " — \(shortenPath(path)):\(line)"
+                }
+
+                // Find matching coverage info
+                if let conformer = coverage.conformers.first(where: { $0.name == r.name }) {
+                    if conformer.missing.isEmpty {
+                        output += " — COMPLETE"
+                    } else {
+                        output += " — MISSING \(conformer.missing.count)"
+                    }
+                    output += "\n"
+                    for name in conformer.missing {
+                        output += "    - \(name) (MISSING)\n"
+                    }
+                } else {
+                    output += "\n"
+                }
+            }
+        } else {
+            for r in results {
+                output += "  \(r.kind) \(r.name)"
+                if let mod = r.moduleName { output += " [\(mod)]" }
+                if let path = r.filePath, let line = r.line {
+                    output += " — \(shortenPath(path)):\(line)"
+                }
+                output += "\n"
+            }
         }
+
         return CallTool.Result(content: [.text(output)])
     }
 
@@ -544,6 +636,10 @@ struct ToolHandlers: Sendable {
             output += formatImpactTree(incoming, indent: 0)
             output += "\n== Outgoing (what \(symbol) depends on) ==\n"
             output += formatImpactTree(outgoing, indent: 0)
+
+            // Add actionable protocol summary if applicable
+            output += formatProtocolImpactSummary(symbolName: symbol)
+
             return CallTool.Result(content: [.text(output)])
         }
 
@@ -559,6 +655,11 @@ struct ToolHandlers: Sendable {
             output += "\nNo transitive dependencies found."
         } else {
             output += "\nTotal: \(nodeCount) symbol(s) in the dependency chain."
+        }
+
+        // Add actionable protocol summary if applicable
+        if direction == .incoming {
+            output += formatProtocolImpactSummary(symbolName: symbol)
         }
 
         return CallTool.Result(content: [.text(output)])
@@ -964,6 +1065,35 @@ struct ToolHandlers: Sendable {
         }
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    // MARK: - Protocol Impact Summary
+
+    /// For protocols, generate actionable compile-impact: which conformers will break and where.
+    private func formatProtocolImpactSummary(symbolName: String) -> String {
+        guard let coverage = try? queryEngine.checkProtocolCoverage(
+            projectId: projectId,
+            protocolName: symbolName,
+            showSatisfied: false
+        ), !coverage.conformers.isEmpty else {
+            return ""
+        }
+
+        var output = "\n== Compile Impact (protocol conformers) ==\n"
+        output += "If you add/change a requirement on \(symbolName), these \(coverage.conformers.count) type(s) need updating:\n\n"
+
+        for conformer in coverage.conformers {
+            output += "  \(conformer.kind) \(conformer.name)"
+            if let path = conformer.filePath, let line = conformer.line {
+                output += " — \(shortenPath(path)):\(line)"
+            }
+            if !conformer.missing.isEmpty {
+                output += " (already missing: \(conformer.missing.joined(separator: ", ")))"
+            }
+            output += "\n"
+        }
+
+        return output
     }
 
     // MARK: - Formatting Helpers

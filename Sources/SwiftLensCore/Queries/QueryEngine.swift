@@ -9,6 +9,109 @@ public struct QueryEngine: Sendable {
         self.db = db
     }
 
+    // MARK: - read_symbol
+
+    /// Read the full source implementation of a symbol from disk.
+    public func readSymbol(
+        projectId: Int64,
+        name: String,
+        contextLines: Int = 0
+    ) throws -> ReadSymbolResult {
+        let record = try db.dbWriter.read { db -> SymbolRecord? in
+            // 1. Exact name match (prefer non-extension, non-file)
+            var symbol = try SymbolRecord
+                .filter(Column("projectId") == projectId)
+                .filter(Column("name") == name)
+                .filter(Column("kind") != NodeKind.extension.rawValue)
+                .filter(Column("kind") != NodeKind.file.rawValue)
+                .filter(Column("kind") != NodeKind.module.rawValue)
+                .filter(sql: "qualifiedName NOT LIKE 'unresolved:%'")
+                .fetchOne(db)
+
+            // 2. Qualified name match
+            if symbol == nil {
+                symbol = try SymbolRecord
+                    .filter(Column("projectId") == projectId)
+                    .filter(Column("qualifiedName") == name)
+                    .filter(sql: "qualifiedName NOT LIKE 'unresolved:%'")
+                    .fetchOne(db)
+            }
+
+            // 3. Extension match (e.g. "extension Array")
+            if symbol == nil {
+                symbol = try SymbolRecord
+                    .filter(Column("projectId") == projectId)
+                    .filter(Column("name") == name)
+                    .filter(Column("kind") == NodeKind.extension.rawValue)
+                    .fetchOne(db)
+            }
+
+            return symbol
+        }
+
+        guard let record, let filePath = record.filePath, let startLine = record.line else {
+            // Try FTS suggestions
+            let suggestions = try db.dbWriter.read { db in
+                try Row.fetchAll(db, sql: """
+                    SELECT s.name, s.qualifiedName, s.kind
+                    FROM symbols s
+                    JOIN symbols_fts ON symbols_fts.rowid = s.rowid
+                    WHERE symbols_fts MATCH ?
+                    AND s.projectId = ?
+                    AND s.qualifiedName NOT LIKE 'unresolved:%'
+                    AND s.kind NOT IN ('file', 'module')
+                    ORDER BY rank LIMIT 5
+                    """, arguments: [ftsQuery(name), projectId])
+                    .map { (row: Row) -> String in
+                        let n: String = row["name"]
+                        let qn: String = row["qualifiedName"]
+                        let kind: String = row["kind"]
+                        return "\(kind) \(qn == n ? n : qn)"
+                    }
+            }
+            return ReadSymbolResult(
+                symbolName: name, kind: nil, qualifiedName: nil,
+                filePath: nil, startLine: nil, endLine: nil,
+                source: nil, suggestions: suggestions
+            )
+        }
+
+        let endLine = record.endLine ?? startLine
+
+        // Read source from disk
+        let readStart = max(1, startLine - contextLines)
+        let readEnd = endLine + contextLines
+
+        let source: String?
+        if FileManager.default.fileExists(atPath: filePath) {
+            let content = try String(contentsOfFile: filePath, encoding: .utf8)
+            let allLines = content.components(separatedBy: "\n")
+            let safeEnd = min(readEnd, allLines.count)
+            if readStart <= safeEnd {
+                let slice = allLines[(readStart - 1)..<safeEnd]
+                source = slice.enumerated().map { offset, line in
+                    let lineNum = readStart + offset
+                    return String(format: "%4d | %@", lineNum, line)
+                }.joined(separator: "\n")
+            } else {
+                source = nil
+            }
+        } else {
+            source = nil
+        }
+
+        return ReadSymbolResult(
+            symbolName: record.name,
+            kind: record.kind,
+            qualifiedName: record.qualifiedName,
+            filePath: filePath,
+            startLine: startLine,
+            endLine: endLine,
+            source: source,
+            suggestions: nil
+        )
+    }
+
     // MARK: - search_symbol
 
     /// Search for symbols by name and/or attribute.
@@ -1879,6 +1982,36 @@ public struct EnvironmentInjectionCheck: Sendable {
     public let keyPath: String
     public let status: InjectionStatus
     public let injectedBy: String?
+}
+
+// MARK: - Source Context Helper
+
+/// Read lines from a file with context around a target line.
+public func readSourceContext(filePath: String, line: Int, contextLines: Int) -> String? {
+    guard FileManager.default.fileExists(atPath: filePath) else { return nil }
+    guard let content = try? String(contentsOfFile: filePath, encoding: .utf8) else { return nil }
+    let allLines = content.components(separatedBy: "\n")
+    let start = max(1, line - contextLines)
+    let end = min(allLines.count, line + contextLines)
+    guard start <= end else { return nil }
+    return allLines[(start - 1)..<end].enumerated().map { offset, text in
+        let lineNum = start + offset
+        let marker = lineNum == line ? ">" : " "
+        return String(format: "%@%4d | %@", marker, lineNum, text)
+    }.joined(separator: "\n")
+}
+
+// MARK: - Read Symbol Result
+
+public struct ReadSymbolResult: Sendable {
+    public let symbolName: String
+    public let kind: String?
+    public let qualifiedName: String?
+    public let filePath: String?
+    public let startLine: Int?
+    public let endLine: Int?
+    public let source: String?          // Numbered source lines
+    public let suggestions: [String]?   // Set when symbol not found
 }
 
 // MARK: - Usage Result Types

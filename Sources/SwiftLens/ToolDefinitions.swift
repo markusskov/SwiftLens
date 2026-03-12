@@ -4,6 +4,7 @@ import MCP
 enum ToolDefinitions {
 
     static let allTools: [Tool] = [
+        readSymbol,
         searchSymbol,
         getSymbol,
         symbolsInFile,
@@ -25,6 +26,26 @@ enum ToolDefinitions {
         crossModuleUsage,
         traceCallGraph,
     ]
+
+    static let readSymbol = Tool(
+        name: "read_symbol",
+        description: "Read the full source implementation of a symbol. Given a symbol name, returns the actual source code lines from disk — not just metadata. This is the fastest way to see how something is implemented without reading the whole file.",
+        inputSchema: .object([
+            "type": .string("object"),
+            "properties": .object([
+                "name": .object([
+                    "type": .string("string"),
+                    "description": .string("Symbol name or qualified name (e.g. 'MovieService', 'MovieService.fetchMovie', 'TMDBQuerying')"),
+                ]),
+                "context_lines": .object([
+                    "type": .string("integer"),
+                    "description": .string("Extra lines of context above/below the symbol (default 0)"),
+                ]),
+            ]),
+            "required": .array([.string("name")]),
+        ]),
+        annotations: .init(readOnlyHint: true)
+    )
 
     static let searchSymbol = Tool(
         name: "search_symbol",
@@ -105,13 +126,17 @@ enum ToolDefinitions {
 
     static let findUsages = Tool(
         name: "find_usages",
-        description: "Find all usage sites of a symbol with file:line locations. For types, shows exact reference locations from type annotations, initializer calls, and static member access. For members (functions/properties), shows references to the parent type as an approximation.",
+        description: "Find all usage sites of a symbol with file:line locations. For types, shows exact reference locations from type annotations, initializer calls, and static member access. For members (functions/properties), shows references to the parent type as an approximation. Use context_lines to see surrounding source code at each site.",
         inputSchema: .object([
             "type": .string("object"),
             "properties": .object([
                 "symbol": .object([
                     "type": .string("string"),
                     "description": .string("Symbol name to find usages of"),
+                ]),
+                "context_lines": .object([
+                    "type": .string("integer"),
+                    "description": .string("Lines of source context to show around each usage site (default 0 — locations only, 2-3 recommended for code review)"),
                 ]),
             ]),
             "required": .array([.string("symbol")]),
@@ -121,13 +146,17 @@ enum ToolDefinitions {
 
     static let findConformers = Tool(
         name: "find_conformers",
-        description: "Find all types that conform to a given protocol, including conformances added via extensions.",
+        description: "Find all types that conform to a given protocol, including conformances added via extensions. Use show_requirements=true to see which protocol methods each conformer implements or is missing — essential when adding a new method to a protocol.",
         inputSchema: .object([
             "type": .string("object"),
             "properties": .object([
                 "protocol": .object([
                     "type": .string("string"),
                     "description": .string("Protocol name to find conformers of"),
+                ]),
+                "show_requirements": .object([
+                    "type": .string("boolean"),
+                    "description": .string("Show implemented/missing protocol requirements per conformer (default false)"),
                 ]),
             ]),
             "required": .array([.string("protocol")]),
@@ -272,7 +301,7 @@ enum ToolDefinitions {
 
     static let impactAnalysis = Tool(
         name: "impact_analysis",
-        description: "Transitive dependency analysis — walk the full dependency graph recursively to show the blast radius of changing a symbol. Shows the complete chain of types that would be affected.",
+        description: "Transitive dependency analysis — walk the full dependency graph recursively to show the blast radius of changing a symbol. Shows the complete chain of types that would be affected. For protocols, includes an actionable summary of which conformers would need updating and in which files.",
         inputSchema: .object([
             "type": .string("object"),
             "properties": .object([
