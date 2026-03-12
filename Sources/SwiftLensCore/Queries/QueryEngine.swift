@@ -142,7 +142,7 @@ public struct QueryEngine: Sendable {
                     """
                 arguments = [ftsQuery(query), projectId]
             } else {
-                // Direct query path (attribute-only search)
+                // Direct query path (kind-only or attribute-only search)
                 sql = """
                     SELECT s.*, COALESCE(m.name, mf.name) AS moduleName
                     FROM symbols s
@@ -1346,6 +1346,11 @@ public struct QueryEngine: Sendable {
                   AND s.qualifiedName NOT LIKE 'file:%'
                   AND s.qualifiedName NOT LIKE 'module:%'
                   AND (s.filePath IS NULL OR (s.filePath NOT LIKE '%/Tests/%' AND s.filePath NOT LIKE '%Tests.swift'))
+                  AND NOT EXISTS (
+                      SELECT 1 FROM edges e2
+                      WHERE e2.sourceId = s.id
+                      AND e2.kind = 'implementsRequirement'
+                  )
                 """
             var arguments: [any DatabaseValueConvertible] = [projectId]
 
@@ -1669,11 +1674,15 @@ public struct QueryEngine: Sendable {
     // MARK: - Helpers
 
     private func ftsQuery(_ query: String) -> String {
-        // Convert user query to FTS5 query with prefix matching
-        let terms = query.split(separator: " ")
+        // Convert user query to FTS5 query with prefix matching.
+        // Split on non-identifier characters so qualified names, signatures, etc. work.
+        // Strip FTS5 special chars (", (, ), :, *, ^, +, -, ~) to prevent syntax errors.
+        let terms = query
+            .split { !$0.isLetter && !$0.isNumber && $0 != "_" }
+            .filter { !$0.isEmpty }
             .map { "\($0)*" }
             .joined(separator: " ")
-        return terms.isEmpty ? "*" : terms
+        return terms.isEmpty ? "a*" : terms
     }
 
     private func buildViewTree(from rows: [Row], rootName: String) -> ViewTreeNode {
@@ -2046,20 +2055,6 @@ public struct AccessControlIssue: Sendable {
 }
 
 // MARK: - Diff Since Types
-
-public enum ChangeStatus: String, Sendable {
-    case added
-    case removed
-    case modified
-}
-
-public struct DiffSinceResult: Sendable {
-    public let commit: String
-    public let filesChanged: Int
-    public let added: [SymbolChange]
-    public let removed: [SymbolChange]
-    public let modified: [SymbolChange]
-}
 
 public struct SymbolChange: Sendable {
     public let name: String

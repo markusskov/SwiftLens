@@ -104,11 +104,11 @@ struct ToolHandlers: Sendable {
         let query = args["query"]?.stringValue
         let attribute = args["attribute"]?.stringValue
 
-        guard query != nil || attribute != nil else {
-            return CallTool.Result(content: [.text("At least one of 'query' or 'attribute' must be provided.")], isError: true)
-        }
-
         let kind = args["kind"]?.stringValue.flatMap { NodeKind(rawValue: $0) }
+
+        guard query != nil || attribute != nil || kind != nil else {
+            return CallTool.Result(content: [.text("At least one of 'query', 'attribute', or 'kind' must be provided.")], isError: true)
+        }
         let module = args["module"]?.stringValue
         let limit = args["limit"]?.intValue ?? 20
 
@@ -167,7 +167,12 @@ struct ToolHandlers: Sendable {
         }
 
         guard let detail else {
-            return CallTool.Result(content: [.text("Symbol '\(name)' not found")])
+            let suggestions = try queryEngine.searchSymbol(projectId: projectId, query: name, limit: 5)
+            if suggestions.isEmpty {
+                return CallTool.Result(content: [.text("Symbol '\(name)' not found")])
+            }
+            let list = suggestions.map { "  \($0.kind) \($0.qualifiedName)" }.joined(separator: "\n")
+            return CallTool.Result(content: [.text("Symbol '\(name)' not found. Did you mean:\n\(list)")])
         }
 
         let output = formatSymbolDetail(detail)

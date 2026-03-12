@@ -45,12 +45,16 @@ struct SwiftUIVisitorTests {
         #expect(compositions.contains { $0.childView == "CustomView" })
     }
 
-    @Test("Only detects composition inside body")
-    func onlyInsideBody() {
+    @Test("Detects composition in body and View-returning helpers")
+    func viewBuilderContexts() {
         let result = extract("""
         struct MyView: View {
             func helperView() -> some View {
                 HelperChild()
+            }
+            func nonViewHelper() -> String {
+                NotAView()
+                return ""
             }
             var body: some View {
                 BodyChild()
@@ -59,9 +63,11 @@ struct SwiftUIVisitorTests {
         """)
 
         let compositions = result.viewCompositions
-        // Only BodyChild should be detected (inside body)
+        // BodyChild in body — detected
         #expect(compositions.contains { $0.childView == "BodyChild" })
-        // HelperChild is NOT inside body
-        #expect(!compositions.contains { $0.childView == "HelperChild" })
+        // HelperChild in a View-returning function — also detected
+        #expect(compositions.contains { $0.childView == "HelperChild" })
+        // NotAView in a non-View-returning function — NOT detected
+        #expect(!compositions.contains { $0.childView == "NotAView" })
     }
 }

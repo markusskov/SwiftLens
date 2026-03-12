@@ -49,7 +49,7 @@ enum ToolDefinitions {
 
     static let searchSymbol = Tool(
         name: "search_symbol",
-        description: "Search for Swift symbols by name, attribute, or both. Uses FTS5 for fast prefix/fuzzy matching on names. Attribute search finds types with specific decorators (e.g. @MainActor, @Observable) and properties with specific wrappers (e.g. @Environment, @State). At least one of query or attribute must be provided.",
+        description: "Search for Swift symbols by name, attribute, kind, or any combination. Uses FTS5 for fast prefix/fuzzy matching on names. Attribute search finds types with specific decorators (e.g. @MainActor, @Observable) and properties with specific wrappers (e.g. @Environment, @State). At least one of query, attribute, or kind must be provided.",
         inputSchema: .object([
             "type": .string("object"),
             "properties": .object([
